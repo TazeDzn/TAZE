@@ -1,0 +1,712 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CustomStrategy
+
+//@version=5
+strategy("SMC: Order Block + BOS + FVG Confluence (Crypto Intraday)",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.075,
+     slippage=2,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=true,
+     max_boxes_count=500,
+     max_lines_count=500)
+
+// =====================================================================================
+// INPUTS
+// =====================================================================================
+
+grp_swing = "Swing / Structure"
+grp_ob    = "Order Block"
+grp_fvg   = "Fair Value Gap"
+grp_risk  = "Risk Management"
+grp_lev   = "Leverage / Liquidation Safety"
+grp_vis   = "Visuals"
+
+swingLookback = input.int(2, "Swing Point Lookback (bars each side)", minval=1, maxval=10, group=grp_swing,
+     tooltip="A swing high needs this many lower highs on each side (same for swing lows). 2 is the standard fractal definition -- fewer bars = more (weaker) swing points, more bars = fewer (stronger) ones. This is the single highest-impact tuning parameter and has NOT been validated against real trade data yet -- treat the default as a starting point, not a proven setting.")
+
+allowLong  = input.bool(true, "Allow Long Trades", group=grp_swing)
+allowShort = input.bool(true, "Allow Short Trades", group=grp_swing)
+
+obDisplacementFilter = input.bool(false, "Require Displacement Candle for Order Block", group=grp_ob,
+     tooltip="When ON, the impulse move that creates the order block must contain at least one candle with a range greater than [Displacement Multiplier] x its average range. This is a stricter quality filter on top of the base order block definition -- OFF uses the standard 'last opposite candle before impulse' definition alone.")
+displacementMult = input.float(1.5, "Displacement Multiplier (x avg range)", minval=1.0, maxval=5.0, step=0.1, group=grp_ob)
+displacementAvgLen = input.int(20, "Displacement Avg Range Length", minval=5, maxval=100, group=grp_ob)
+obMaxAgeBarss = input.int(100, "Order Block Max Age (bars)", minval=10, maxval=500, group=grp_ob,
+     tooltip="An order block older than this is considered stale and is no longer eligible for a retest entry.")
+
+fvgMinGapPct = input.float(0.0, "Min. FVG Gap Size (% of price)", minval=0.0, maxval=2.0, step=0.05, group=grp_fvg,
+     tooltip="Filters out negligibly small gaps. 0 disables this filter (any qualifying 3-candle gap counts).")
+requireFVGConfluence = input.bool(false, "Require FVG Confluence for Entry (stricter)", group=grp_fvg,
+     tooltip="OFF (default): OB retest alone triggers entry; FVG overlap is shown as a confidence flag only. ON: entry requires BOTH an OB retest AND an active, unfilled FVG overlapping that OB zone -- a narrow intersection that produced near-zero trades in testing. Start OFF and only enable this after confirming the base OB+BOS logic generates a reasonable trade count.")
+
+grp_adapt = "Adaptive Parameters"
+
+rrTP1Mult = input.float(1.0, "TP1 Distance (x stop distance) - Base", minval=0.1, maxval=10.0, step=0.1, group=grp_risk,
+     tooltip="Base TP1 multiple before volatility adaptation is applied (see Adaptive Parameters group).")
+rrTP2Mult = input.float(3.0, "TP2 Distance (x stop distance) - Base", minval=0.1, maxval=10.0, step=0.1, group=grp_risk,
+     tooltip="Base TP2 multiple before volatility adaptation is applied (see Adaptive Parameters group).")
+tp1ClosePct = input.float(70.0, "TP1 Close Percentage", minval=1.0, maxval=99.0, step=1.0, group=grp_risk,
+     tooltip="Percent of the position closed when TP1 is hit. The remainder rides toward TP2.")
+moveStopToBreakeven = input.bool(true, "Move Stop to Breakeven After TP1", group=grp_risk,
+     tooltip="Once TP1 fills, the stop on the remaining position moves to entry price, so the runner toward TP2 risks nothing further.")
+riskPercent = input.float(2.0, "Risk Per Trade (% of Equity) - Base", minval=0.1, maxval=25.0, step=0.1, group=grp_risk,
+     tooltip="Base risk percent before win-rate adaptation is applied (see Adaptive Parameters group). Position size is derived from this and the structural stop distance.")
+
+useVolatilityAdaptiveTP = input.bool(true, "Volatility-Adaptive TP Targets", group=grp_adapt,
+     tooltip="When ON, TP1/TP2 multiples scale up in high-volatility regimes (ATR well above its own average) and scale down in low-volatility regimes, since moves tend to run further when volatility is elevated. This adapts to CURRENT market conditions only -- it does not use the strategy's own trade history, so it carries no curve-fitting risk. When OFF, TP1/TP2 use their fixed base multiples above.")
+atrRegimeLen = input.int(100, "ATR Regime Average Length", minval=20, maxval=500, group=grp_adapt,
+     tooltip="Current ATR is compared against its average over this many bars to determine the volatility regime.")
+volAdaptSensitivity = input.float(0.5, "Volatility Adaptation Sensitivity", minval=0.0, maxval=2.0, step=0.1, group=grp_adapt,
+     tooltip="How strongly TP multiples react to the volatility regime. 0 = no reaction (same as OFF). Higher = TP multiples swing further from their base value as volatility deviates from its average.")
+
+useWinRateAdaptiveSizing = input.bool(true, "Win-Rate-Adaptive Position Sizing", group=grp_adapt,
+     tooltip="When ON, risk-per-trade scales down after a recent string of losses and up after a recent string of wins, based on a rolling window of past trades. This uses the strategy's OWN trade history, unlike the volatility adaptation above -- it changes bet SIZE only, never which trades are taken, so it carries limited, bounded risk rather than the curve-fitting risk of adapting entry criteria to past performance.")
+winRateWindow = input.int(20, "Win-Rate Rolling Window (trades)", minval=5, maxval=100, group=grp_adapt,
+     tooltip="Number of most recent closed trades used to calculate the rolling win rate that drives sizing adaptation.")
+winRateAdaptSensitivity = input.float(0.5, "Win-Rate Adaptation Sensitivity", minval=0.0, maxval=2.0, step=0.1, group=grp_adapt,
+     tooltip="How strongly risk-per-trade reacts to the rolling win rate. 0 = no reaction (same as OFF).")
+minRiskPercent = input.float(0.5, "Minimum Risk Per Trade (%)", minval=0.1, maxval=10.0, step=0.1, group=grp_adapt,
+     tooltip="Floor for adaptive risk sizing -- risk per trade never drops below this, regardless of how strongly the win-rate adaptation would otherwise reduce it.")
+maxRiskPercent = input.float(4.0, "Maximum Risk Per Trade (%)", minval=0.1, maxval=25.0, step=0.1, group=grp_adapt,
+     tooltip="Ceiling for adaptive risk sizing -- risk per trade never exceeds this, regardless of how strongly the win-rate adaptation would otherwise increase it.")
+
+useLeverage = input.bool(false, "Trading on Leveraged Futures (not spot)", group=grp_lev,
+     tooltip="Turn ON if this runs on a leveraged futures/margin account. Activates liquidation-aware position sizing -- caps position size so it can never exceed what your margin and exchange's maintenance-margin rules can actually support. Leave OFF for spot/no-leverage accounts.")
+leverageAmt = input.float(10.0, "Leverage (x)", minval=1.0, maxval=125.0, step=1.0, group=grp_lev)
+maintMarginPct = input.float(0.5, "Maintenance Margin Rate (%)", minval=0.1, maxval=10.0, step=0.05, group=grp_lev,
+     tooltip="Your exchange's maintenance margin rate for your typical position size. Varies by exchange AND position size -- check your exchange's futures margin-tier table. Do not assume this default matches your platform.")
+liqSafetyBufferMult = input.float(1.5, "Liquidation Safety Buffer (x stop distance)", minval=1.1, maxval=5.0, step=0.1, group=grp_lev,
+     tooltip="Liquidation distance must be at least this many multiples of the structural stop distance, or the trade is skipped entirely.")
+
+showOB   = input.bool(true, "Show Order Block Zones", group=grp_vis)
+showFVG  = input.bool(true, "Show Fair Value Gaps", group=grp_vis)
+showBOS  = input.bool(false, "Show BOS Markers", group=grp_vis)
+showMarkers = input.bool(true, "Show Entry/Exit/SL/TP Markers", group=grp_vis)
+showTable = input.bool(true, "Show Performance Table", group=grp_vis)
+
+// =====================================================================================
+// SWING POINT DETECTION
+// =====================================================================================
+// Standard fractal definition: a swing high has `swingLookback` bars with a LOWER high
+// on each side; a swing low has `swingLookback` bars with a HIGHER low on each side.
+// ta.pivothigh/pivotlow repaint until `swingLookback` bars have passed (they can only be
+// confirmed in hindsight) -- this is a genuine, unavoidable trait of retrospective swing
+// detection, not a bug. It means swing-dependent plots update retroactively, but the
+// entry logic below only acts on already-confirmed swings, so it does not affect trades.
+
+swingHigh = ta.pivothigh(high, swingLookback, swingLookback)
+swingLow  = ta.pivotlow(low, swingLookback, swingLookback)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+// CRITICAL: lastSwingHigh/lastSwingLow track the relevant structural level that a genuine
+// break-of-structure needs to exceed. This must NOT update on every confirmed pivot --
+// with a short swingLookback, minor pivots confirm constantly during normal back-and-forth
+// price action, and if the tracked level chased every one of them, it would frequently
+// update to a level very close to (or effectively behind) current price, leaving little
+// room for a real crossover/crossunder to ever register. A prior version of this script
+// had exactly that bug: it updated on every confirmed pivot rather than only on a
+// genuinely more extreme one, which is why BOS rarely fired and entries were near-zero.
+//
+// Fix: only adopt a newly confirmed pivot as the tracked level if it is MORE EXTREME than
+// the currently tracked one (a real higher high for swing highs, a real lower low for
+// swing lows) OR if there is no tracked level yet OR if the previously tracked level was
+// just consumed by a BOS (see the reset logic further below, after BOS is calculated).
+if not na(swingHigh) and (na(lastSwingHigh) or swingHigh > lastSwingHigh)
+    lastSwingHigh := swingHigh
+
+if not na(swingLow) and (na(lastSwingLow) or swingLow < lastSwingLow)
+    lastSwingLow := swingLow
+
+// =====================================================================================
+// BREAK OF STRUCTURE (BOS)
+// =====================================================================================
+// A confirmed candle CLOSE beyond the tracked swing high/low. Using close (not wick)
+// avoids false BOS signals from a single spike that immediately reverses.
+
+bullishBOS = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
+bearishBOS = not na(lastSwingLow)  and ta.crossunder(close, lastSwingLow)
+
+// Once a level is broken (BOS fires), it's no longer meaningful as "the level to break" --
+// reset it to na so the next genuinely new, more extreme pivot becomes the new tracked
+// level, rather than leaving a stale (already-broken) value that a later, smaller pivot
+// could never exceed under the "more extreme than current" rule above.
+if bullishBOS
+    lastSwingHigh := na
+if bearishBOS
+    lastSwingLow := na
+
+// =====================================================================================
+// DISPLACEMENT CHECK (optional quality filter for order block validity)
+// =====================================================================================
+
+barRange = high - low
+avgRange = ta.sma(barRange, displacementAvgLen)
+isDisplacementCandle = barRange > (avgRange * displacementMult)
+
+// =====================================================================================
+// VOLATILITY-ADAPTIVE TP MULTIPLIERS
+// =====================================================================================
+// currentATR / its own longer-term average gives a volatility-REGIME ratio: >1 means
+// "more volatile than usual lately", <1 means "calmer than usual". This uses only
+// real-time price data, never the strategy's own trade outcomes, so it carries no
+// curve-fitting risk -- the adaptation is fully determined by market conditions that
+// exist independently of whether past trades won or lost.
+
+atr14 = ta.atr(14)
+atrRegimeAvg = ta.sma(atr14, atrRegimeLen)
+volRegimeRatio = atrRegimeAvg > 0 ? atr14 / atrRegimeAvg : 1.0
+
+// Scale the base TP multiples by the regime ratio, damped by the sensitivity input.
+// At sensitivity=0, adaptedMult == baseMult regardless of regime (adaptation fully off).
+// At sensitivity=1, the multiple scales linearly with the regime ratio.
+volAdaptFactor = 1.0 + ((volRegimeRatio - 1.0) * volAdaptSensitivity)
+volAdaptFactorClamped = math.max(volAdaptFactor, 0.2)  // floor so TP can't collapse to ~0 in extreme low-vol readings
+
+adaptedTP1Mult = useVolatilityAdaptiveTP ? rrTP1Mult * volAdaptFactorClamped : rrTP1Mult
+adaptedTP2Mult = useVolatilityAdaptiveTP ? rrTP2Mult * volAdaptFactorClamped : rrTP2Mult
+
+// =====================================================================================
+// WIN-RATE-ADAPTIVE POSITION SIZING
+// =====================================================================================
+// Tracks win/loss outcomes of the last `winRateWindow` closed trades using a simple
+// array-based rolling buffer, then scales risk-per-trade around the base riskPercent
+// input. This DOES use the strategy's own trade history (unlike the volatility
+// adaptation above), but it only ever changes position SIZE, never which setups qualify
+// as valid entries -- so a run of variance-driven losses can only make future trades
+// smaller, not filter out future setups the way an entry-criteria adaptation could.
+
+var array<bool> recentTradeResults = array.new<bool>()
+
+// Append the most recently closed trade's win/loss outcome exactly once, right after
+// strategy.closedtrades increments (i.e. the bar a position fully closes)
+var int lastSeenClosedTrades = 0
+
+if strategy.closedtrades > lastSeenClosedTrades
+    lastTradeWon = strategy.closedtrades.profit(strategy.closedtrades - 1) > 0
+    array.push(recentTradeResults, lastTradeWon)
+    if array.size(recentTradeResults) > winRateWindow
+        array.shift(recentTradeResults)
+    lastSeenClosedTrades := strategy.closedtrades
+
+// Win-count via a small loop over the bool array (Pine has no built-in bool-array sum)
+countRollingWins() =>
+    wins = 0
+    if array.size(recentTradeResults) > 0
+        for i = 0 to array.size(recentTradeResults) - 1
+            if array.get(recentTradeResults, i)
+                wins += 1
+    wins
+
+rollingWinCount = countRollingWins()
+rollingWinRatePct = array.size(recentTradeResults) > 0 ? (rollingWinCount / array.size(recentTradeResults)) * 100.0 : 50.0
+
+// Compare rolling win rate against a neutral 50% baseline: above 50% scales risk up,
+// below 50% scales risk down, damped by sensitivity. Requires a minimum sample before
+// adapting at all, so a handful of early trades (high variance) can't swing sizing hard.
+MIN_TRADES_BEFORE_ADAPT = 5
+hasEnoughTradesForAdapt = array.size(recentTradeResults) >= MIN_TRADES_BEFORE_ADAPT
+
+winRateAdaptFactor = hasEnoughTradesForAdapt ?
+     1.0 + (((rollingWinRatePct - 50.0) / 50.0) * winRateAdaptSensitivity) : 1.0
+
+adaptedRiskPercentRaw = useWinRateAdaptiveSizing ? riskPercent * winRateAdaptFactor : riskPercent
+adaptedRiskPercent = math.max(math.min(adaptedRiskPercentRaw, maxRiskPercent), minRiskPercent)
+
+MAX_OB_SCAN_BACK = 30
+
+// Explicit buffer-size hints for series referenced with a dynamic (loop-variable) offset
+// inside findBullishOB()/findBearishOB() below. Pine can usually auto-determine this for
+// simple cases, but a derived series (isDisplacementCandle) referenced via a variable
+// offset inside a conditionally-called function is a known trigger for the "cannot
+// determine referencing length" compile error -- these calls prevent that defensively.
+max_bars_back(isDisplacementCandle, MAX_OB_SCAN_BACK)
+max_bars_back(close, MAX_OB_SCAN_BACK)
+max_bars_back(open, MAX_OB_SCAN_BACK)
+
+// =====================================================================================
+// ORDER BLOCK IDENTIFICATION
+// =====================================================================================
+// Definition: the last opposite-color candle before the impulse move that caused BOS.
+// For a BULLISH BOS (impulse moved price UP through a swing high), the order block is
+// the last BEARISH (red) candle before that up-move began.
+// For a BEARISH BOS (impulse moved price DOWN through a swing low), the order block is
+// the last BULLISH (green) candle before that down-move began.
+//
+// Implementation: on the bar a BOS confirms, scan backward bar-by-bar from the BOS bar
+// until we find a candle of the opposite color to the impulse direction. That candle's
+// high/low defines the order block zone. We cap the scan at a reasonable lookback to
+// avoid runaway loops on unusual data. (MAX_OB_SCAN_BACK is declared earlier in the file,
+// alongside the max_bars_back() calls that reference it.)
+
+findBullishOB() =>
+    float obHigh = na
+    float obLow  = na
+    int obBar = na
+    bool foundDisplacement = false
+    for i = 1 to MAX_OB_SCAN_BACK
+        idx = bar_index - i
+        if idx < 0
+            break
+        c = close[i]
+        o = open[i]
+        if isDisplacementCandle[i]
+            foundDisplacement := true
+        // First bearish (red) candle scanning backward = the order block
+        if c < o
+            obHigh := high[i]
+            obLow  := low[i]
+            obBar  := idx
+            break
+    [obHigh, obLow, obBar, foundDisplacement]
+
+findBearishOB() =>
+    float obHigh = na
+    float obLow  = na
+    int obBar = na
+    bool foundDisplacement = false
+    for i = 1 to MAX_OB_SCAN_BACK
+        idx = bar_index - i
+        if idx < 0
+            break
+        c = close[i]
+        o = open[i]
+        if isDisplacementCandle[i]
+            foundDisplacement := true
+        // First bullish (green) candle scanning backward = the order block
+        if c > o
+            obHigh := high[i]
+            obLow  := low[i]
+            obBar  := idx
+            break
+    [obHigh, obLow, obBar, foundDisplacement]
+
+// Active order block state -- persists between bars until consumed by an entry or aged out
+var float activeBullOBHigh = na
+var float activeBullOBLow  = na
+var int   activeBullOBBar  = na
+var bool  activeBullOBValid = false
+
+var float activeBearOBHigh = na
+var float activeBearOBLow  = na
+var int   activeBearOBBar  = na
+var bool  activeBearOBValid = false
+
+if bullishBOS
+    [obH, obL, obB, hasDisp] = findBullishOB()
+    if not na(obH) and (not obDisplacementFilter or hasDisp)
+        activeBullOBHigh := obH
+        activeBullOBLow  := obL
+        activeBullOBBar  := obB
+        activeBullOBValid := true
+
+if bearishBOS
+    [obH, obL, obB, hasDisp] = findBearishOB()
+    if not na(obH) and (not obDisplacementFilter or hasDisp)
+        activeBearOBHigh := obH
+        activeBearOBLow  := obL
+        activeBearOBBar  := obB
+        activeBearOBValid := true
+
+// Age out order blocks that have exceeded their max age without being retested
+if activeBullOBValid and not na(activeBullOBBar) and (bar_index - activeBullOBBar) > obMaxAgeBarss
+    activeBullOBValid := false
+
+if activeBearOBValid and not na(activeBearOBBar) and (bar_index - activeBearOBBar) > obMaxAgeBarss
+    activeBearOBValid := false
+
+// =====================================================================================
+// FAIR VALUE GAP (FVG) DETECTION
+// =====================================================================================
+// Classic 3-candle definition:
+//   Bullish FVG: candle[2].high < candle[0].low  (gap between bar 2 bars ago and current)
+//   Bearish FVG: candle[2].low  > candle[0].high
+// where candle[0] is the current bar and candle[2] is two bars back (candle 1 of 3 in
+// the traditional numbering). The middle candle (candle[1]) is the displacement candle
+// that creates the imbalance.
+
+bullishFVG = low > high[2]
+bearishFVG = high < low[2]
+
+fvgGapSizePct(topPrice, bottomPrice) =>
+    (topPrice - bottomPrice) / bottomPrice * 100
+
+bullishFVGSizeOK = bullishFVG and (fvgMinGapPct == 0 or fvgGapSizePct(low, high[2]) >= fvgMinGapPct)
+bearishFVGSizeOK = bearishFVG and (fvgMinGapPct == 0 or fvgGapSizePct(low[2], high) >= fvgMinGapPct)
+
+// Track active (unfilled) FVG zones so we can check for overlap with order block zones.
+// An FVG is considered "filled" once price trades back through the full gap.
+// NOTE: this tracks only the MOST RECENT bullish/bearish FVG, not a full history of every
+// unfilled gap -- a new qualifying FVG replaces the previously tracked one (and its box)
+// even if the prior one hasn't filled yet. This keeps the confluence check and the chart
+// display simple and matches how a trader would typically watch "the current gap", at the
+// cost of not surfacing older, still-open gaps further back.
+var float bullFVGTop = na
+var float bullFVGBottom = na
+var bool  bullFVGActive = false
+var box   bullFVGBox = na
+
+var float bearFVGTop = na
+var float bearFVGBottom = na
+var bool  bearFVGActive = false
+var box   bearFVGBox = na
+
+if bullishFVGSizeOK
+    if not na(bullFVGBox)
+        box.delete(bullFVGBox)
+    bullFVGTop := low
+    bullFVGBottom := high[2]
+    bullFVGActive := true
+    if showFVG
+        bullFVGBox := box.new(bar_index - 2, low, bar_index + 5, high[2],
+             border_color=color.new(color.blue, 50), bgcolor=color.new(color.blue, 88))
+
+if bearishFVGSizeOK
+    if not na(bearFVGBox)
+        box.delete(bearFVGBox)
+    bearFVGTop := low[2]
+    bearFVGBottom := high
+    bearFVGActive := true
+    if showFVG
+        bearFVGBox := box.new(bar_index - 2, low[2], bar_index + 5, high,
+             border_color=color.new(color.orange, 50), bgcolor=color.new(color.orange, 88))
+
+// Mark bullish FVG filled once price trades back down through its full range, and
+// remove its box from the chart at the same time
+if bullFVGActive and not na(bullFVGBottom) and low <= bullFVGBottom
+    bullFVGActive := false
+    if not na(bullFVGBox)
+        box.delete(bullFVGBox)
+        bullFVGBox := na
+
+// Mark bearish FVG filled once price trades back up through its full range, and
+// remove its box from the chart at the same time
+if bearFVGActive and not na(bearFVGTop) and high >= bearFVGTop
+    bearFVGActive := false
+
+// =====================================================================================
+// FVG / ORDER BLOCK OVERLAP CHECK (confluence -- required OR flagged, per toggle below)
+// =====================================================================================
+// requireFVGConfluence = true:  entry ONLY allowed if an active FVG from the same impulse
+//   overlaps the OB zone. This is a narrow intersection -- price often either fills the
+//   FVG before reaching the OB, or the OB retest happens after the FVG already filled
+//   separately, so this combination produced near-zero trades in testing.
+// requireFVGConfluence = false (default): OB retest alone triggers entry. FVG overlap is
+//   still calculated and shown on-chart/in the table as a confidence flag, but doesn't
+//   gate the trade.
+
+rangesOverlap(aTop, aBottom, bTop, bBottom) =>
+    aTop >= bBottom and bTop >= aBottom
+
+longOBHasFVGConfluence  = activeBullOBValid and bullFVGActive and not na(activeBullOBHigh) and not na(bullFVGTop) and
+     rangesOverlap(activeBullOBHigh, activeBullOBLow, bullFVGTop, bullFVGBottom)
+
+shortOBHasFVGConfluence = activeBearOBValid and bearFVGActive and not na(activeBearOBHigh) and not na(bearFVGTop) and
+     rangesOverlap(activeBearOBHigh, activeBearOBLow, bearFVGTop, bearFVGBottom)
+
+// =====================================================================================
+// ENTRY TRIGGER: price retraces back into the order block zone
+// =====================================================================================
+
+priceInBullOBZone = activeBullOBValid and not na(activeBullOBHigh) and low <= activeBullOBHigh and high >= activeBullOBLow
+priceInBearOBZone = activeBearOBValid and not na(activeBearOBHigh) and high >= activeBearOBLow and low <= activeBearOBHigh
+
+longEntrySignal  = priceInBullOBZone  and (not requireFVGConfluence or longOBHasFVGConfluence)  and allowLong  and strategy.position_size == 0
+shortEntrySignal = priceInBearOBZone and (not requireFVGConfluence or shortOBHasFVGConfluence) and allowShort and strategy.position_size == 0
+
+// =====================================================================================
+// STRUCTURAL STOP / TARGET CALCULATION
+// =====================================================================================
+// Stop: beyond the order block's far edge (below OB low for longs, above OB high for shorts)
+// TP1 / TP2: structural distance multiples of the stop distance (not ATR-based)
+
+longStopPrice_raw  = activeBullOBLow
+shortStopPrice_raw = activeBearOBHigh
+
+longStopDistance_raw  = longEntrySignal  and not na(longStopPrice_raw)  ? close - longStopPrice_raw  : na
+shortStopDistance_raw = shortEntrySignal and not na(shortStopPrice_raw) ? shortStopPrice_raw - close : na
+
+// =====================================================================================
+// LEVERAGE / LIQUIDATION SAFETY (same approach validated in the prior strategy)
+// =====================================================================================
+
+liqDistanceFraction = useLeverage ? math.max((1.0 / leverageAmt) - (maintMarginPct / 100), 0.0) : na
+liqDistancePrice = useLeverage ? close * liqDistanceFraction : na
+
+longLiqSafe  = na(liqDistancePrice) or na(longStopDistance_raw)  ? true : (liqDistancePrice >= longStopDistance_raw  * liqSafetyBufferMult)
+shortLiqSafe = na(liqDistancePrice) or na(shortStopDistance_raw) ? true : (liqDistancePrice >= shortStopDistance_raw * liqSafetyBufferMult)
+
+// =====================================================================================
+// POSITION SIZING
+// =====================================================================================
+
+longRiskCapital  = strategy.equity * (adaptedRiskPercent / 100)
+shortRiskCapital = strategy.equity * (adaptedRiskPercent / 100)
+
+longQtyRiskBased  = not na(longStopDistance_raw)  and longStopDistance_raw  > 0 ? longRiskCapital  / longStopDistance_raw  : 0.0
+shortQtyRiskBased = not na(shortStopDistance_raw) and shortStopDistance_raw > 0 ? shortRiskCapital / shortStopDistance_raw : 0.0
+
+longQtyLeverageCap  = useLeverage and close > 0 ? (strategy.equity * leverageAmt) / close : 1e15
+shortQtyLeverageCap = useLeverage and close > 0 ? (strategy.equity * leverageAmt) / close : 1e15
+
+longQty  = math.min(longQtyRiskBased,  longQtyLeverageCap)
+shortQty = math.min(shortQtyRiskBased, shortQtyLeverageCap)
+
+// =====================================================================================
+// ENTRIES
+// =====================================================================================
+
+var int longBlockedByLiqSafety  = 0
+var int shortBlockedByLiqSafety = 0
+
+if longEntrySignal and not longLiqSafe
+    longBlockedByLiqSafety := longBlockedByLiqSafety + 1
+
+if shortEntrySignal and not shortLiqSafe
+    shortBlockedByLiqSafety := shortBlockedByLiqSafety + 1
+
+// Store stop/TP levels at the moment of entry (before position_size changes) so they
+// don't shift if the order block itself gets invalidated/reused on a later bar
+var float longStopPrice = na
+var float longTP1Price  = na
+var float longTP2Price  = na
+var float shortStopPrice = na
+var float shortTP1Price  = na
+var float shortTP2Price  = na
+var bool  longTP1Filled  = false
+var bool  shortTP1Filled = false
+
+if longEntrySignal and longLiqSafe and longQty > 0
+    strategy.entry("Long", strategy.long, qty=longQty)
+    longStopPrice := longStopPrice_raw
+    longTP1Price  := close + (longStopDistance_raw * adaptedTP1Mult)
+    longTP2Price  := close + (longStopDistance_raw * adaptedTP2Mult)
+    longTP1Filled := false
+    activeBullOBValid := false  // consume the order block so it isn't reused for a second entry
+    alert("SMC Long Entry: " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if shortEntrySignal and shortLiqSafe and shortQty > 0
+    strategy.entry("Short", strategy.short, qty=shortQty)
+    shortStopPrice := shortStopPrice_raw
+    shortTP1Price  := close - (shortStopDistance_raw * adaptedTP1Mult)
+    shortTP2Price  := close - (shortStopDistance_raw * adaptedTP2Mult)
+    shortTP1Filled := false
+    activeBearOBValid := false
+    alert("SMC Short Entry: " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// =====================================================================================
+// EXITS -- partial TP1, breakeven stop upgrade, then TP2 / stop for the remainder
+// =====================================================================================
+// IMPORTANT STRUCTURE NOTE: qty_percent on a strategy.exit() call sizes BOTH its stop
+// and limit order to that percentage. If the TP1 exit call's stop were sized to only
+// tp1ClosePct% of the position, a stop-loss hit before TP1 would close that percentage
+// and leave the remainder with no active exit order at all until the next bar's logic
+// re-evaluates -- a real gap during a fast move. To avoid this, the stop-loss is always
+// submitted as a SEPARATE full-size exit covering 100% of the position, while a second,
+// limit-only exit handles the tiered TP1/TP2 take-profit split. Since only one of the
+// stop or a limit can actually fill for a given bracket, and Pine cancels sibling orders
+// tied to the same from_entry once one fills, the full-size stop and the tiered limit
+// coexist safely: whichever triggers first (stop, TP1, or TP2) governs that portion.
+
+if strategy.position_size > 0
+    // Full-size stop-loss -- always covers the entire remaining position
+    strategy.exit("Long Stop", from_entry="Long", stop=longStopPrice, comment_loss="Stop Loss",
+         alert_loss="SMC Long STOPPED OUT: " + syminfo.ticker + " @ " + str.tostring(longStopPrice))
+    if not longTP1Filled
+        // Limit-only order for TP1, sized to tp1ClosePct of the position
+        strategy.exit("Long TP1", from_entry="Long", limit=longTP1Price,
+             qty_percent=tp1ClosePct, comment_profit="TP1",
+             alert_profit="SMC Long TP1 HIT: " + syminfo.ticker + " @ " + str.tostring(longTP1Price))
+        if high >= longTP1Price
+            longTP1Filled := true
+            if moveStopToBreakeven
+                longStopPrice := strategy.opentrades.entry_price(strategy.opentrades - 1)
+    if longTP1Filled
+        // Limit-only order for TP2, covering whatever quantity remains after TP1
+        strategy.exit("Long TP2", from_entry="Long", limit=longTP2Price, comment_profit="TP2",
+             alert_profit="SMC Long TP2 HIT: " + syminfo.ticker + " @ " + str.tostring(longTP2Price))
+
+if strategy.position_size < 0
+    strategy.exit("Short Stop", from_entry="Short", stop=shortStopPrice, comment_loss="Stop Loss",
+         alert_loss="SMC Short STOPPED OUT: " + syminfo.ticker + " @ " + str.tostring(shortStopPrice))
+    if not shortTP1Filled
+        strategy.exit("Short TP1", from_entry="Short", limit=shortTP1Price,
+             qty_percent=tp1ClosePct, comment_profit="TP1",
+             alert_profit="SMC Short TP1 HIT: " + syminfo.ticker + " @ " + str.tostring(shortTP1Price))
+        if low <= shortTP1Price
+            shortTP1Filled := true
+            if moveStopToBreakeven
+                shortStopPrice := strategy.opentrades.entry_price(strategy.opentrades - 1)
+    if shortTP1Filled
+        strategy.exit("Short TP2", from_entry="Short", limit=shortTP2Price, comment_profit="TP2",
+             alert_profit="SMC Short TP2 HIT: " + syminfo.ticker + " @ " + str.tostring(shortTP2Price))
+
+// Reset per-position state once fully flat
+if strategy.position_size == 0
+    longStopPrice := na
+    longTP1Price := na
+    longTP2Price := na
+    longTP1Filled := false
+    shortStopPrice := na
+    shortTP1Price := na
+    shortTP2Price := na
+    shortTP1Filled := false
+
+// =====================================================================================
+// VISUALS
+// =====================================================================================
+
+// Order block zones as boxes -- drawn ONCE per order block (on the bar it's identified),
+// not redrawn every bar it remains active, since extend=extend.right already makes the
+// box grow forward automatically. A persistent box reference lets us delete the old box
+// when a new order block replaces it or the old one is consumed/aged out.
+var box bullOBBox = na
+var box bearOBBox = na
+
+if bullishBOS and activeBullOBValid and not na(activeBullOBHigh)
+    if not na(bullOBBox)
+        box.delete(bullOBBox)
+    if showOB
+        bullOBBox := box.new(activeBullOBBar, activeBullOBHigh, bar_index + 10, activeBullOBLow,
+             border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 85), extend=extend.right)
+
+if bearishBOS and activeBearOBValid and not na(activeBearOBHigh)
+    if not na(bearOBBox)
+        box.delete(bearOBBox)
+    if showOB
+        bearOBBox := box.new(activeBearOBBar, activeBearOBHigh, bar_index + 10, activeBearOBLow,
+             border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 85), extend=extend.right)
+
+// Clean up the box once its order block is consumed by an entry or aged out
+if not activeBullOBValid and not na(bullOBBox)
+    box.delete(bullOBBox)
+    bullOBBox := na
+
+if not activeBearOBValid and not na(bearOBBox)
+    box.delete(bearOBBox)
+    bearOBBox := na
+
+// FVG boxes are created/deleted inline in the FVG detection section above (they need
+// lifecycle management tied to fill-state, not a one-shot draw here).
+
+// BOS markers -- small diamonds, no text label (text-labels render as filled boxes and
+// add significant visual weight when BOS events are frequent). Off by default: this is
+// structural/diagnostic info, useful when checking why an order block formed where it
+// did, but not needed to read the strategy's actual trades day-to-day.
+plotshape(showBOS and bullishBOS, title="Bullish BOS", style=shape.diamond,
+     location=location.belowbar, color=color.new(color.green, 30), size=size.tiny)
+plotshape(showBOS and bearishBOS, title="Bearish BOS", style=shape.diamond,
+     location=location.abovebar, color=color.new(color.red, 30), size=size.tiny)
+
+// Entry markers
+plotshape(showMarkers and longEntrySignal and longLiqSafe, title="Long Entry", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showMarkers and shortEntrySignal and shortLiqSafe, title="Short Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+// Exit markers colored by reason
+longClosedThisBar  = strategy.position_size <= 0 and strategy.position_size[1] > 0
+shortClosedThisBar = strategy.position_size >= 0 and strategy.position_size[1] < 0
+
+lastExitComment = strategy.closedtrades > 0 ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : na
+
+exitColorFromComment(cmt) =>
+    na(cmt) ? color.gray :
+     str.contains(cmt, "Stop Loss") ? color.red :
+     str.contains(cmt, "TP1") ? color.lime :
+     str.contains(cmt, "TP2") ? color.green :
+     color.gray
+
+plotshape(showMarkers and longClosedThisBar, title="Long Position Closed", style=shape.xcross,
+     location=location.abovebar, color=color.new(exitColorFromComment(lastExitComment), 20), size=size.tiny)
+plotshape(showMarkers and shortClosedThisBar, title="Short Position Closed", style=shape.xcross,
+     location=location.belowbar, color=color.new(exitColorFromComment(lastExitComment), 20), size=size.tiny)
+
+// SL / TP lines for the open position
+plot(showMarkers and strategy.position_size > 0 ? longStopPrice : na,
+     title="Long Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showMarkers and strategy.position_size > 0 and not longTP1Filled ? longTP1Price : na,
+     title="Long TP1", color=color.new(color.lime, 0), style=plot.style_circles, linewidth=2)
+plot(showMarkers and strategy.position_size > 0 ? longTP2Price : na,
+     title="Long TP2", color=color.new(color.green, 0), style=plot.style_circles, linewidth=2)
+
+plot(showMarkers and strategy.position_size < 0 ? shortStopPrice : na,
+     title="Short Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showMarkers and strategy.position_size < 0 and not shortTP1Filled ? shortTP1Price : na,
+     title="Short TP1", color=color.new(color.lime, 0), style=plot.style_circles, linewidth=2)
+plot(showMarkers and strategy.position_size < 0 ? shortTP2Price : na,
+     title="Short TP2", color=color.new(color.green, 0), style=plot.style_circles, linewidth=2)
+
+// =====================================================================================
+// PERFORMANCE TABLE
+// =====================================================================================
+
+if showTable and barstate.islast
+    var table perfTable = table.new(position.top_right, 2, 12, border_width=1)
+
+    totalTrades  = strategy.closedtrades
+    winTrades    = strategy.wintrades
+    winRate      = totalTrades > 0 ? (winTrades / totalTrades) * 100 : 0
+    netProfit    = strategy.netprofit
+    netProfitPct = (strategy.netprofit / strategy.initial_capital) * 100
+    profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    maxDD        = strategy.max_drawdown
+    maxDDPct     = (strategy.max_drawdown / strategy.initial_capital) * 100
+    avgTrade     = totalTrades > 0 ? strategy.netprofit / totalTrades : 0
+    openPos      = strategy.position_size > 0 ? "Long" : strategy.position_size < 0 ? "Short" : "Flat"
+
+    table.cell(perfTable, 0, 0, "Metric", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 1, "Net Profit", text_size=size.small)
+    table.cell(perfTable, 1, 1, str.tostring(netProfit, "#.##") + " (" + str.tostring(netProfitPct, "#.##") + "%)",
+         text_color=netProfit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 2, "Total Trades", text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(totalTrades), text_size=size.small)
+
+    table.cell(perfTable, 0, 3, "Win Rate", text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(winRate, "#.##") + "%", text_size=size.small)
+
+    table.cell(perfTable, 0, 4, "Profit Factor", text_size=size.small)
+    table.cell(perfTable, 1, 4, na(profitFactor) ? "N/A" : str.tostring(profitFactor, "#.##"), text_size=size.small)
+
+    table.cell(perfTable, 0, 5, "Max Drawdown", text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(maxDD, "#.##") + " (" + str.tostring(maxDDPct, "#.##") + "%)",
+         text_color=color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 6, "Avg Trade P&L", text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(avgTrade, "#.##"), text_size=size.small)
+
+    table.cell(perfTable, 0, 7, "Current Position", text_size=size.small)
+    table.cell(perfTable, 1, 7, openPos,
+         text_color=openPos == "Long" ? color.green : openPos == "Short" ? color.red : color.gray, text_size=size.small)
+
+    // -- Adaptive parameter section: live, currently-in-effect values --
+    table.cell(perfTable, 0, 8, "Vol. Regime", bgcolor=color.new(color.blue, 75), text_size=size.small)
+    table.cell(perfTable, 1, 8, useVolatilityAdaptiveTP ? str.tostring(volRegimeRatio, "#.##") + "x avg" : "OFF",
+         text_color=color.gray, text_size=size.small)
+
+    table.cell(perfTable, 0, 9, "Current TP1/TP2", bgcolor=color.new(color.blue, 75), text_size=size.small)
+    table.cell(perfTable, 1, 9, str.tostring(adaptedTP1Mult, "#.##") + "x / " + str.tostring(adaptedTP2Mult, "#.##") + "x",
+         text_color=color.gray, text_size=size.small)
+
+    table.cell(perfTable, 0, 10, "Rolling Win Rate (" + str.tostring(winRateWindow) + ")", bgcolor=color.new(color.purple, 75), text_size=size.small)
+    table.cell(perfTable, 1, 10, hasEnoughTradesForAdapt ? str.tostring(rollingWinRatePct, "#.##") + "%" : "Building sample",
+         text_color=color.gray, text_size=size.small)
+
+    table.cell(perfTable, 0, 11, "Current Risk/Trade", bgcolor=color.new(color.purple, 75), text_size=size.small)
+    table.cell(perfTable, 1, 11, str.tostring(adaptedRiskPercent, "#.##") + "%",
+         text_color=color.gray, text_size=size.small)
+
+    if useLeverage
+        totalBlocked = longBlockedByLiqSafety + shortBlockedByLiqSafety
+        table.cell(perfTable, 0, 12, "Blocked (Liq. Risk)", text_size=size.small)
+        table.cell(perfTable, 1, 12, str.tostring(totalBlocked), text_color=color.gray, text_size=size.small)

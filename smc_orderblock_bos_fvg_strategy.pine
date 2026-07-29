@@ -1,0 +1,565 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CustomStrategy
+
+//@version=5
+strategy("SMC: Order Block + BOS + FVG Confluence (Crypto Intraday)",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.075,
+     slippage=2,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=true,
+     max_boxes_count=500,
+     max_lines_count=500)
+
+// =====================================================================================
+// INPUTS
+// =====================================================================================
+
+grp_swing = "Swing / Structure"
+grp_ob    = "Order Block"
+grp_fvg   = "Fair Value Gap"
+grp_risk  = "Risk Management"
+grp_lev   = "Leverage / Liquidation Safety"
+grp_vis   = "Visuals"
+
+swingLookback = input.int(2, "Swing Point Lookback (bars each side)", minval=1, maxval=10, group=grp_swing,
+     tooltip="A swing high needs this many lower highs on each side (same for swing lows). 2 is the standard fractal definition -- fewer bars = more (weaker) swing points, more bars = fewer (stronger) ones. This is the single highest-impact tuning parameter and has NOT been validated against real trade data yet -- treat the default as a starting point, not a proven setting.")
+
+allowLong  = input.bool(true, "Allow Long Trades", group=grp_swing)
+allowShort = input.bool(true, "Allow Short Trades", group=grp_swing)
+
+obDisplacementFilter = input.bool(false, "Require Displacement Candle for Order Block", group=grp_ob,
+     tooltip="When ON, the impulse move that creates the order block must contain at least one candle with a range greater than [Displacement Multiplier] x its average range. This is a stricter quality filter on top of the base order block definition -- OFF uses the standard 'last opposite candle before impulse' definition alone.")
+displacementMult = input.float(1.5, "Displacement Multiplier (x avg range)", minval=1.0, maxval=5.0, step=0.1, group=grp_ob)
+displacementAvgLen = input.int(20, "Displacement Avg Range Length", minval=5, maxval=100, group=grp_ob)
+obMaxAgeBarss = input.int(100, "Order Block Max Age (bars)", minval=10, maxval=500, group=grp_ob,
+     tooltip="An order block older than this is considered stale and is no longer eligible for a retest entry.")
+
+fvgMinGapPct = input.float(0.0, "Min. FVG Gap Size (% of price)", minval=0.0, maxval=2.0, step=0.05, group=grp_fvg,
+     tooltip="Filters out negligibly small gaps. 0 disables this filter (any qualifying 3-candle gap counts).")
+
+rrTP1Mult = input.float(1.0, "TP1 Distance (x stop distance)", minval=0.1, maxval=10.0, step=0.1, group=grp_risk)
+rrTP2Mult = input.float(3.0, "TP2 Distance (x stop distance)", minval=0.1, maxval=10.0, step=0.1, group=grp_risk)
+tp1ClosePct = input.float(70.0, "TP1 Close Percentage", minval=1.0, maxval=99.0, step=1.0, group=grp_risk,
+     tooltip="Percent of the position closed when TP1 is hit. The remainder rides toward TP2.")
+moveStopToBreakeven = input.bool(true, "Move Stop to Breakeven After TP1", group=grp_risk,
+     tooltip="Once TP1 fills, the stop on the remaining position moves to entry price, so the runner toward TP2 risks nothing further.")
+riskPercent = input.float(2.0, "Risk Per Trade (% of Equity)", minval=0.1, maxval=25.0, step=0.1, group=grp_risk,
+     tooltip="Percent of equity risked (i.e. lost if the full position hits stop) per trade. Position size is derived from this and the structural stop distance.")
+
+useLeverage = input.bool(false, "Trading on Leveraged Futures (not spot)", group=grp_lev,
+     tooltip="Turn ON if this runs on a leveraged futures/margin account. Activates liquidation-aware position sizing -- caps position size so it can never exceed what your margin and exchange's maintenance-margin rules can actually support. Leave OFF for spot/no-leverage accounts.")
+leverageAmt = input.float(10.0, "Leverage (x)", minval=1.0, maxval=125.0, step=1.0, group=grp_lev)
+maintMarginPct = input.float(0.5, "Maintenance Margin Rate (%)", minval=0.1, maxval=10.0, step=0.05, group=grp_lev,
+     tooltip="Your exchange's maintenance margin rate for your typical position size. Varies by exchange AND position size -- check your exchange's futures margin-tier table. Do not assume this default matches your platform.")
+liqSafetyBufferMult = input.float(1.5, "Liquidation Safety Buffer (x stop distance)", minval=1.1, maxval=5.0, step=0.1, group=grp_lev,
+     tooltip="Liquidation distance must be at least this many multiples of the structural stop distance, or the trade is skipped entirely.")
+
+showOB   = input.bool(true, "Show Order Block Zones", group=grp_vis)
+showFVG  = input.bool(true, "Show Fair Value Gaps", group=grp_vis)
+showBOS  = input.bool(true, "Show BOS Markers", group=grp_vis)
+showMarkers = input.bool(true, "Show Entry/Exit/SL/TP Markers", group=grp_vis)
+showTable = input.bool(true, "Show Performance Table", group=grp_vis)
+
+// =====================================================================================
+// SWING POINT DETECTION
+// =====================================================================================
+// Standard fractal definition: a swing high has `swingLookback` bars with a LOWER high
+// on each side; a swing low has `swingLookback` bars with a HIGHER low on each side.
+// ta.pivothigh/pivotlow repaint until `swingLookback` bars have passed (they can only be
+// confirmed in hindsight) -- this is a genuine, unavoidable trait of retrospective swing
+// detection, not a bug. It means swing-dependent plots update retroactively, but the
+// entry logic below only acts on already-confirmed swings, so it does not affect trades.
+
+swingHigh = ta.pivothigh(high, swingLookback, swingLookback)
+swingLow  = ta.pivotlow(low, swingLookback, swingLookback)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar  = na
+
+// Track the most recent CONFIRMED swing high/low (confirmed swingLookback bars after
+// the actual pivot, per how ta.pivothigh/pivotlow work)
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+    lastSwingHighBar := bar_index - swingLookback
+
+if not na(swingLow)
+    lastSwingLow := swingLow
+    lastSwingLowBar := bar_index - swingLookback
+
+// Keep a short history of the last two confirmed swings on each side, since BOS needs
+// "the most recent relevant swing" which changes as new swings confirm
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+
+if not na(swingHigh) and lastSwingHigh != swingHigh
+    prevSwingHigh := lastSwingHigh
+
+if not na(swingLow) and lastSwingLow != swingLow
+    prevSwingLow := lastSwingLow
+
+// =====================================================================================
+// BREAK OF STRUCTURE (BOS)
+// =====================================================================================
+// A confirmed candle CLOSE beyond the most recent swing high/low. Using close (not
+// wick) avoids false BOS signals from a single spike that immediately reverses.
+
+bullishBOS = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
+bearishBOS = not na(lastSwingLow)  and ta.crossunder(close, lastSwingLow)
+
+// =====================================================================================
+// DISPLACEMENT CHECK (optional quality filter for order block validity)
+// =====================================================================================
+
+barRange = high - low
+avgRange = ta.sma(barRange, displacementAvgLen)
+isDisplacementCandle = barRange > (avgRange * displacementMult)
+
+MAX_OB_SCAN_BACK = 30
+
+// Explicit buffer-size hints for series referenced with a dynamic (loop-variable) offset
+// inside findBullishOB()/findBearishOB() below. Pine can usually auto-determine this for
+// simple cases, but a derived series (isDisplacementCandle) referenced via a variable
+// offset inside a conditionally-called function is a known trigger for the "cannot
+// determine referencing length" compile error -- these calls prevent that defensively.
+max_bars_back(isDisplacementCandle, MAX_OB_SCAN_BACK)
+max_bars_back(close, MAX_OB_SCAN_BACK)
+max_bars_back(open, MAX_OB_SCAN_BACK)
+
+// =====================================================================================
+// ORDER BLOCK IDENTIFICATION
+// =====================================================================================
+// Definition: the last opposite-color candle before the impulse move that caused BOS.
+// For a BULLISH BOS (impulse moved price UP through a swing high), the order block is
+// the last BEARISH (red) candle before that up-move began.
+// For a BEARISH BOS (impulse moved price DOWN through a swing low), the order block is
+// the last BULLISH (green) candle before that down-move began.
+//
+// Implementation: on the bar a BOS confirms, scan backward bar-by-bar from the BOS bar
+// until we find a candle of the opposite color to the impulse direction. That candle's
+// high/low defines the order block zone. We cap the scan at a reasonable lookback to
+// avoid runaway loops on unusual data. (MAX_OB_SCAN_BACK is declared earlier in the file,
+// alongside the max_bars_back() calls that reference it.)
+
+findBullishOB() =>
+    float obHigh = na
+    float obLow  = na
+    int obBar = na
+    bool foundDisplacement = false
+    for i = 1 to MAX_OB_SCAN_BACK
+        idx = bar_index - i
+        if idx < 0
+            break
+        c = close[i]
+        o = open[i]
+        if isDisplacementCandle[i]
+            foundDisplacement := true
+        // First bearish (red) candle scanning backward = the order block
+        if c < o
+            obHigh := high[i]
+            obLow  := low[i]
+            obBar  := idx
+            break
+    [obHigh, obLow, obBar, foundDisplacement]
+
+findBearishOB() =>
+    float obHigh = na
+    float obLow  = na
+    int obBar = na
+    bool foundDisplacement = false
+    for i = 1 to MAX_OB_SCAN_BACK
+        idx = bar_index - i
+        if idx < 0
+            break
+        c = close[i]
+        o = open[i]
+        if isDisplacementCandle[i]
+            foundDisplacement := true
+        // First bullish (green) candle scanning backward = the order block
+        if c > o
+            obHigh := high[i]
+            obLow  := low[i]
+            obBar  := idx
+            break
+    [obHigh, obLow, obBar, foundDisplacement]
+
+// Active order block state -- persists between bars until consumed by an entry or aged out
+var float activeBullOBHigh = na
+var float activeBullOBLow  = na
+var int   activeBullOBBar  = na
+var bool  activeBullOBValid = false
+
+var float activeBearOBHigh = na
+var float activeBearOBLow  = na
+var int   activeBearOBBar  = na
+var bool  activeBearOBValid = false
+
+if bullishBOS
+    [obH, obL, obB, hasDisp] = findBullishOB()
+    if not na(obH) and (not obDisplacementFilter or hasDisp)
+        activeBullOBHigh := obH
+        activeBullOBLow  := obL
+        activeBullOBBar  := obB
+        activeBullOBValid := true
+
+if bearishBOS
+    [obH, obL, obB, hasDisp] = findBearishOB()
+    if not na(obH) and (not obDisplacementFilter or hasDisp)
+        activeBearOBHigh := obH
+        activeBearOBLow  := obL
+        activeBearOBBar  := obB
+        activeBearOBValid := true
+
+// Age out order blocks that have exceeded their max age without being retested
+if activeBullOBValid and not na(activeBullOBBar) and (bar_index - activeBullOBBar) > obMaxAgeBarss
+    activeBullOBValid := false
+
+if activeBearOBValid and not na(activeBearOBBar) and (bar_index - activeBearOBBar) > obMaxAgeBarss
+    activeBearOBValid := false
+
+// =====================================================================================
+// FAIR VALUE GAP (FVG) DETECTION
+// =====================================================================================
+// Classic 3-candle definition:
+//   Bullish FVG: candle[2].high < candle[0].low  (gap between bar 2 bars ago and current)
+//   Bearish FVG: candle[2].low  > candle[0].high
+// where candle[0] is the current bar and candle[2] is two bars back (candle 1 of 3 in
+// the traditional numbering). The middle candle (candle[1]) is the displacement candle
+// that creates the imbalance.
+
+bullishFVG = low > high[2]
+bearishFVG = high < low[2]
+
+fvgGapSizePct(topPrice, bottomPrice) =>
+    (topPrice - bottomPrice) / bottomPrice * 100
+
+bullishFVGSizeOK = bullishFVG and (fvgMinGapPct == 0 or fvgGapSizePct(low, high[2]) >= fvgMinGapPct)
+bearishFVGSizeOK = bearishFVG and (fvgMinGapPct == 0 or fvgGapSizePct(low[2], high) >= fvgMinGapPct)
+
+// Track active (unfilled) FVG zones so we can check for overlap with order block zones.
+// An FVG is considered "filled" once price trades back through the full gap.
+var float bullFVGTop = na
+var float bullFVGBottom = na
+var bool  bullFVGActive = false
+
+var float bearFVGTop = na
+var float bearFVGBottom = na
+var bool  bearFVGActive = false
+
+if bullishFVGSizeOK
+    bullFVGTop := low
+    bullFVGBottom := high[2]
+    bullFVGActive := true
+
+if bearishFVGSizeOK
+    bearFVGTop := low[2]
+    bearFVGBottom := high
+    bearFVGActive := true
+
+// Mark bullish FVG filled once price trades back down through its full range
+if bullFVGActive and not na(bullFVGBottom) and low <= bullFVGBottom
+    bullFVGActive := false
+
+// Mark bearish FVG filled once price trades back up through its full range
+if bearFVGActive and not na(bearFVGTop) and high >= bearFVGTop
+    bearFVGActive := false
+
+// =====================================================================================
+// FVG / ORDER BLOCK OVERLAP CHECK (confluence -- required per current settings)
+// =====================================================================================
+// Since FVG confluence is a HARD FILTER: an order block only qualifies for entry if an
+// active FVG from the same impulse move overlaps its price zone.
+
+rangesOverlap(aTop, aBottom, bTop, bBottom) =>
+    aTop >= bBottom and bTop >= aBottom
+
+longOBHasFVGConfluence  = activeBullOBValid and bullFVGActive and not na(activeBullOBHigh) and not na(bullFVGTop) and
+     rangesOverlap(activeBullOBHigh, activeBullOBLow, bullFVGTop, bullFVGBottom)
+
+shortOBHasFVGConfluence = activeBearOBValid and bearFVGActive and not na(activeBearOBHigh) and not na(bearFVGTop) and
+     rangesOverlap(activeBearOBHigh, activeBearOBLow, bearFVGTop, bearFVGBottom)
+
+// =====================================================================================
+// ENTRY TRIGGER: price retraces back into the order block zone (with required FVG confluence)
+// =====================================================================================
+
+priceInBullOBZone = activeBullOBValid and not na(activeBullOBHigh) and low <= activeBullOBHigh and high >= activeBullOBLow
+priceInBearOBZone = activeBearOBValid and not na(activeBearOBHigh) and high >= activeBearOBLow and low <= activeBearOBHigh
+
+longEntrySignal  = priceInBullOBZone and longOBHasFVGConfluence  and allowLong  and strategy.position_size == 0
+shortEntrySignal = priceInBearOBZone and shortOBHasFVGConfluence and allowShort and strategy.position_size == 0
+
+// =====================================================================================
+// STRUCTURAL STOP / TARGET CALCULATION
+// =====================================================================================
+// Stop: beyond the order block's far edge (below OB low for longs, above OB high for shorts)
+// TP1 / TP2: structural distance multiples of the stop distance (not ATR-based)
+
+longStopPrice_raw  = activeBullOBLow
+shortStopPrice_raw = activeBearOBHigh
+
+longStopDistance_raw  = longEntrySignal  and not na(longStopPrice_raw)  ? close - longStopPrice_raw  : na
+shortStopDistance_raw = shortEntrySignal and not na(shortStopPrice_raw) ? shortStopPrice_raw - close : na
+
+// =====================================================================================
+// LEVERAGE / LIQUIDATION SAFETY (same approach validated in the prior strategy)
+// =====================================================================================
+
+liqDistanceFraction = useLeverage ? math.max((1.0 / leverageAmt) - (maintMarginPct / 100), 0.0) : na
+liqDistancePrice = useLeverage ? close * liqDistanceFraction : na
+
+longLiqSafe  = na(liqDistancePrice) or na(longStopDistance_raw)  ? true : (liqDistancePrice >= longStopDistance_raw  * liqSafetyBufferMult)
+shortLiqSafe = na(liqDistancePrice) or na(shortStopDistance_raw) ? true : (liqDistancePrice >= shortStopDistance_raw * liqSafetyBufferMult)
+
+// =====================================================================================
+// POSITION SIZING
+// =====================================================================================
+
+longRiskCapital  = strategy.equity * (riskPercent / 100)
+shortRiskCapital = strategy.equity * (riskPercent / 100)
+
+longQtyRiskBased  = not na(longStopDistance_raw)  and longStopDistance_raw  > 0 ? longRiskCapital  / longStopDistance_raw  : 0.0
+shortQtyRiskBased = not na(shortStopDistance_raw) and shortStopDistance_raw > 0 ? shortRiskCapital / shortStopDistance_raw : 0.0
+
+longQtyLeverageCap  = useLeverage and close > 0 ? (strategy.equity * leverageAmt) / close : 1e15
+shortQtyLeverageCap = useLeverage and close > 0 ? (strategy.equity * leverageAmt) / close : 1e15
+
+longQty  = math.min(longQtyRiskBased,  longQtyLeverageCap)
+shortQty = math.min(shortQtyRiskBased, shortQtyLeverageCap)
+
+// =====================================================================================
+// ENTRIES
+// =====================================================================================
+
+var int longBlockedByLiqSafety  = 0
+var int shortBlockedByLiqSafety = 0
+
+if longEntrySignal and not longLiqSafe
+    longBlockedByLiqSafety := longBlockedByLiqSafety + 1
+
+if shortEntrySignal and not shortLiqSafe
+    shortBlockedByLiqSafety := shortBlockedByLiqSafety + 1
+
+// Store stop/TP levels at the moment of entry (before position_size changes) so they
+// don't shift if the order block itself gets invalidated/reused on a later bar
+var float longStopPrice = na
+var float longTP1Price  = na
+var float longTP2Price  = na
+var float shortStopPrice = na
+var float shortTP1Price  = na
+var float shortTP2Price  = na
+var bool  longTP1Filled  = false
+var bool  shortTP1Filled = false
+
+if longEntrySignal and longLiqSafe and longQty > 0
+    strategy.entry("Long", strategy.long, qty=longQty)
+    longStopPrice := longStopPrice_raw
+    longTP1Price  := close + (longStopDistance_raw * rrTP1Mult)
+    longTP2Price  := close + (longStopDistance_raw * rrTP2Mult)
+    longTP1Filled := false
+    activeBullOBValid := false  // consume the order block so it isn't reused for a second entry
+
+if shortEntrySignal and shortLiqSafe and shortQty > 0
+    strategy.entry("Short", strategy.short, qty=shortQty)
+    shortStopPrice := shortStopPrice_raw
+    shortTP1Price  := close - (shortStopDistance_raw * rrTP1Mult)
+    shortTP2Price  := close - (shortStopDistance_raw * rrTP2Mult)
+    shortTP1Filled := false
+    activeBearOBValid := false
+
+// =====================================================================================
+// EXITS -- partial TP1, breakeven stop upgrade, then TP2 / stop for the remainder
+// =====================================================================================
+// IMPORTANT STRUCTURE NOTE: qty_percent on a strategy.exit() call sizes BOTH its stop
+// and limit order to that percentage. If the TP1 exit call's stop were sized to only
+// tp1ClosePct% of the position, a stop-loss hit before TP1 would close that percentage
+// and leave the remainder with no active exit order at all until the next bar's logic
+// re-evaluates -- a real gap during a fast move. To avoid this, the stop-loss is always
+// submitted as a SEPARATE full-size exit covering 100% of the position, while a second,
+// limit-only exit handles the tiered TP1/TP2 take-profit split. Since only one of the
+// stop or a limit can actually fill for a given bracket, and Pine cancels sibling orders
+// tied to the same from_entry once one fills, the full-size stop and the tiered limit
+// coexist safely: whichever triggers first (stop, TP1, or TP2) governs that portion.
+
+if strategy.position_size > 0
+    // Full-size stop-loss -- always covers the entire remaining position
+    strategy.exit("Long Stop", from_entry="Long", stop=longStopPrice, comment_loss="Stop Loss")
+    if not longTP1Filled
+        // Limit-only order for TP1, sized to tp1ClosePct of the position
+        strategy.exit("Long TP1", from_entry="Long", limit=longTP1Price,
+             qty_percent=tp1ClosePct, comment_profit="TP1")
+        if high >= longTP1Price
+            longTP1Filled := true
+            if moveStopToBreakeven
+                longStopPrice := strategy.opentrades.entry_price(strategy.opentrades - 1)
+    if longTP1Filled
+        // Limit-only order for TP2, covering whatever quantity remains after TP1
+        strategy.exit("Long TP2", from_entry="Long", limit=longTP2Price, comment_profit="TP2")
+
+if strategy.position_size < 0
+    strategy.exit("Short Stop", from_entry="Short", stop=shortStopPrice, comment_loss="Stop Loss")
+    if not shortTP1Filled
+        strategy.exit("Short TP1", from_entry="Short", limit=shortTP1Price,
+             qty_percent=tp1ClosePct, comment_profit="TP1")
+        if low <= shortTP1Price
+            shortTP1Filled := true
+            if moveStopToBreakeven
+                shortStopPrice := strategy.opentrades.entry_price(strategy.opentrades - 1)
+    if shortTP1Filled
+        strategy.exit("Short TP2", from_entry="Short", limit=shortTP2Price, comment_profit="TP2")
+
+// Reset per-position state once fully flat
+if strategy.position_size == 0
+    longStopPrice := na
+    longTP1Price := na
+    longTP2Price := na
+    longTP1Filled := false
+    shortStopPrice := na
+    shortTP1Price := na
+    shortTP2Price := na
+    shortTP1Filled := false
+
+// =====================================================================================
+// VISUALS
+// =====================================================================================
+
+// Order block zones as boxes -- drawn ONCE per order block (on the bar it's identified),
+// not redrawn every bar it remains active, since extend=extend.right already makes the
+// box grow forward automatically. A persistent box reference lets us delete the old box
+// when a new order block replaces it or the old one is consumed/aged out.
+var box bullOBBox = na
+var box bearOBBox = na
+
+if bullishBOS and activeBullOBValid and not na(activeBullOBHigh)
+    if not na(bullOBBox)
+        box.delete(bullOBBox)
+    if showOB
+        bullOBBox := box.new(activeBullOBBar, activeBullOBHigh, bar_index + 10, activeBullOBLow,
+             border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 85), extend=extend.right)
+
+if bearishBOS and activeBearOBValid and not na(activeBearOBHigh)
+    if not na(bearOBBox)
+        box.delete(bearOBBox)
+    if showOB
+        bearOBBox := box.new(activeBearOBBar, activeBearOBHigh, bar_index + 10, activeBearOBLow,
+             border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 85), extend=extend.right)
+
+// Clean up the box once its order block is consumed by an entry or aged out
+if not activeBullOBValid and not na(bullOBBox)
+    box.delete(bullOBBox)
+    bullOBBox := na
+
+if not activeBearOBValid and not na(bearOBBox)
+    box.delete(bearOBBox)
+    bearOBBox := na
+
+// FVG zones as boxes
+if showFVG and bullishFVGSizeOK
+    box.new(bar_index - 2, low, bar_index + 5, high[2],
+         border_color=color.new(color.blue, 50), bgcolor=color.new(color.blue, 88))
+
+if showFVG and bearishFVGSizeOK
+    box.new(bar_index - 2, low[2], bar_index + 5, high,
+         border_color=color.new(color.orange, 50), bgcolor=color.new(color.orange, 88))
+
+// BOS markers
+plotshape(showBOS and bullishBOS, title="Bullish BOS", style=shape.labelup, location=location.belowbar,
+     color=color.new(color.green, 0), text="BOS", textcolor=color.white, size=size.tiny)
+plotshape(showBOS and bearishBOS, title="Bearish BOS", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.red, 0), text="BOS", textcolor=color.white, size=size.tiny)
+
+// Entry markers
+plotshape(showMarkers and longEntrySignal and longLiqSafe, title="Long Entry", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showMarkers and shortEntrySignal and shortLiqSafe, title="Short Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+// Exit markers colored by reason
+longClosedThisBar  = strategy.position_size <= 0 and strategy.position_size[1] > 0
+shortClosedThisBar = strategy.position_size >= 0 and strategy.position_size[1] < 0
+
+lastExitComment = strategy.closedtrades > 0 ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : na
+
+exitColorFromComment(cmt) =>
+    na(cmt) ? color.gray :
+     str.contains(cmt, "Stop Loss") ? color.red :
+     str.contains(cmt, "TP1") ? color.lime :
+     str.contains(cmt, "TP2") ? color.green :
+     color.gray
+
+plotshape(showMarkers and longClosedThisBar, title="Long Position Closed", style=shape.xcross,
+     location=location.abovebar, color=color.new(exitColorFromComment(lastExitComment), 20), size=size.tiny)
+plotshape(showMarkers and shortClosedThisBar, title="Short Position Closed", style=shape.xcross,
+     location=location.belowbar, color=color.new(exitColorFromComment(lastExitComment), 20), size=size.tiny)
+
+// SL / TP lines for the open position
+plot(showMarkers and strategy.position_size > 0 ? longStopPrice : na,
+     title="Long Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showMarkers and strategy.position_size > 0 and not longTP1Filled ? longTP1Price : na,
+     title="Long TP1", color=color.new(color.lime, 0), style=plot.style_circles, linewidth=2)
+plot(showMarkers and strategy.position_size > 0 ? longTP2Price : na,
+     title="Long TP2", color=color.new(color.green, 0), style=plot.style_circles, linewidth=2)
+
+plot(showMarkers and strategy.position_size < 0 ? shortStopPrice : na,
+     title="Short Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showMarkers and strategy.position_size < 0 and not shortTP1Filled ? shortTP1Price : na,
+     title="Short TP1", color=color.new(color.lime, 0), style=plot.style_circles, linewidth=2)
+plot(showMarkers and strategy.position_size < 0 ? shortTP2Price : na,
+     title="Short TP2", color=color.new(color.green, 0), style=plot.style_circles, linewidth=2)
+
+// =====================================================================================
+// PERFORMANCE TABLE
+// =====================================================================================
+
+if showTable and barstate.islast
+    var table perfTable = table.new(position.top_right, 2, 9, border_width=1)
+
+    totalTrades  = strategy.closedtrades
+    winTrades    = strategy.wintrades
+    winRate      = totalTrades > 0 ? (winTrades / totalTrades) * 100 : 0
+    netProfit    = strategy.netprofit
+    netProfitPct = (strategy.netprofit / strategy.initial_capital) * 100
+    profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    maxDD        = strategy.max_drawdown
+    maxDDPct     = (strategy.max_drawdown / strategy.initial_capital) * 100
+    avgTrade     = totalTrades > 0 ? strategy.netprofit / totalTrades : 0
+    openPos      = strategy.position_size > 0 ? "Long" : strategy.position_size < 0 ? "Short" : "Flat"
+
+    table.cell(perfTable, 0, 0, "Metric", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 1, "Net Profit", text_size=size.small)
+    table.cell(perfTable, 1, 1, str.tostring(netProfit, "#.##") + " (" + str.tostring(netProfitPct, "#.##") + "%)",
+         text_color=netProfit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 2, "Total Trades", text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(totalTrades), text_size=size.small)
+
+    table.cell(perfTable, 0, 3, "Win Rate", text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(winRate, "#.##") + "%", text_size=size.small)
+
+    table.cell(perfTable, 0, 4, "Profit Factor", text_size=size.small)
+    table.cell(perfTable, 1, 4, na(profitFactor) ? "N/A" : str.tostring(profitFactor, "#.##"), text_size=size.small)
+
+    table.cell(perfTable, 0, 5, "Max Drawdown", text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(maxDD, "#.##") + " (" + str.tostring(maxDDPct, "#.##") + "%)",
+         text_color=color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 6, "Avg Trade P&L", text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(avgTrade, "#.##"), text_size=size.small)
+
+    table.cell(perfTable, 0, 7, "Current Position", text_size=size.small)
+    table.cell(perfTable, 1, 7, openPos,
+         text_color=openPos == "Long" ? color.green : openPos == "Short" ? color.red : color.gray, text_size=size.small)
+
+    if useLeverage
+        totalBlocked = longBlockedByLiqSafety + shortBlockedByLiqSafety
+        table.cell(perfTable, 0, 8, "Blocked (Liq. Risk)", text_size=size.small)
+        table.cell(perfTable, 1, 8, str.tostring(totalBlocked), text_color=color.gray, text_size=size.small)

@@ -1,0 +1,200 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CustomStrategy
+
+//@version=5
+strategy("Donchian Breakout + Volume Confirmation (Crypto Intraday)",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.075,
+     slippage=2,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=true)
+
+// =====================================================================================
+// INPUTS
+// =====================================================================================
+
+grp_range   = "Range / Breakout Settings"
+grp_vol     = "Volume Confirmation"
+grp_risk    = "Risk Management"
+grp_vis     = "Visuals"
+
+donchianLen = input.int(55, "Donchian Channel Length", minval=5, maxval=200, group=grp_range,
+     tooltip="Number of bars used to calculate the breakout high/low. Longer = fewer, higher-conviction signals.")
+
+volMALen    = input.int(20, "Volume MA Length", minval=5, maxval=100, group=grp_vol)
+volMultiplier = input.float(1.5, "Volume Multiplier (x average)", minval=1.0, maxval=5.0, step=0.1, group=grp_vol,
+     tooltip="Volume must exceed this multiple of its moving average to confirm a breakout.")
+
+atrLen      = input.int(14, "ATR Length", minval=5, maxval=50, group=grp_risk)
+atrMult     = input.float(2.0, "ATR Stop Multiplier", minval=0.5, maxval=10.0, step=0.1, group=grp_risk,
+     tooltip="Stop-loss distance = ATR x this multiplier.")
+rrRatio     = input.float(2.0, "Take Profit R:R Ratio", minval=0.5, maxval=10.0, step=0.1, group=grp_risk,
+     tooltip="Take-profit distance = stop-loss distance x this ratio.")
+riskPercent = input.float(2.0, "Risk Per Trade (% of Equity)", minval=0.1, maxval=25.0, step=0.1, group=grp_risk,
+     tooltip="Percent of current equity risked per trade. Position size is derived from this and the ATR stop distance.")
+
+allowLong   = input.bool(true, "Allow Long Trades", group=grp_range)
+allowShort  = input.bool(true, "Allow Short Trades", group=grp_range)
+
+showTable   = input.bool(true, "Show Performance Table", group=grp_vis)
+showMarkers = input.bool(true, "Show Entry/Exit/SL/TP Markers", group=grp_vis)
+
+// =====================================================================================
+// CORE CALCULATIONS
+// =====================================================================================
+
+donchianHigh = ta.highest(high, donchianLen)
+donchianLow  = ta.lowest(low, donchianLen)
+
+// Use the prior bar's channel so the breakout is measured against the range
+// that existed BEFORE the current bar, avoiding lookahead/repainting issues.
+priorHigh = donchianHigh[1]
+priorLow  = donchianLow[1]
+
+volMA = ta.sma(volume, volMALen)
+volConfirmed = volume > (volMA * volMultiplier)
+
+atrVal = ta.atr(atrLen)
+
+longBreakout  = ta.crossover(close, priorHigh)
+shortBreakout = ta.crossunder(close, priorLow)
+
+longEntrySignal  = longBreakout  and volConfirmed and allowLong
+shortEntrySignal = shortBreakout and volConfirmed and allowShort
+
+// Opposite-side channel break used as the discretionary exit trigger
+longExitSignal  = ta.crossunder(close, priorLow)
+shortExitSignal = ta.crossover(close, priorHigh)
+
+// =====================================================================================
+// POSITION SIZING
+// =====================================================================================
+// Contracts = (Equity x Risk%) / (Stop distance in price x price)
+// strategy.equity is used so sizing adapts as the account grows or shrinks.
+
+longStopDistance  = atrVal * atrMult
+shortStopDistance = atrVal * atrMult
+
+longRiskCapital  = strategy.equity * (riskPercent / 100)
+shortRiskCapital = strategy.equity * (riskPercent / 100)
+
+longQty  = longStopDistance  > 0 ? longRiskCapital  / longStopDistance  : 0
+shortQty = shortStopDistance > 0 ? shortRiskCapital / shortStopDistance : 0
+
+// =====================================================================================
+// ENTRIES
+// =====================================================================================
+
+if longEntrySignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=longQty)
+
+if shortEntrySignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=shortQty)
+
+// =====================================================================================
+// EXITS
+// =====================================================================================
+// Each position exits on whichever comes first: ATR stop, R:R take-profit,
+// or an opposite-side Donchian break.
+
+var float longStopPrice  = na
+var float longTPPrice    = na
+var float shortStopPrice = na
+var float shortTPPrice   = na
+
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    longStopPrice := close - longStopDistance
+    longTPPrice   := close + (longStopDistance * rrRatio)
+
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    shortStopPrice := close + shortStopDistance
+    shortTPPrice   := close - (shortStopDistance * rrRatio)
+
+if strategy.position_size <= 0
+    longStopPrice := na
+    longTPPrice   := na
+
+if strategy.position_size >= 0
+    shortStopPrice := na
+    shortTPPrice   := na
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry="Long", stop=longStopPrice, limit=longTPPrice)
+    if longExitSignal
+        strategy.close("Long", comment="Opposite Signal")
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry="Short", stop=shortStopPrice, limit=shortTPPrice)
+    if shortExitSignal
+        strategy.close("Short", comment="Opposite Signal")
+
+// =====================================================================================
+// VISUALS - Entry / Exit / SL / TP markers only (clean chart, no channel plotted)
+// =====================================================================================
+
+plotshape(showMarkers and longEntrySignal, title="Long Entry", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.small, text="LONG")
+
+plotshape(showMarkers and shortEntrySignal, title="Short Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="SHORT")
+
+plot(showMarkers and strategy.position_size > 0 ? longStopPrice : na,
+     title="Long Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(showMarkers and strategy.position_size > 0 ? longTPPrice : na,
+     title="Long Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+
+plot(showMarkers and strategy.position_size < 0 ? shortStopPrice : na,
+     title="Short Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(showMarkers and strategy.position_size < 0 ? shortTPPrice : na,
+     title="Short Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+
+// =====================================================================================
+// PERFORMANCE TABLE
+// =====================================================================================
+
+if showTable and barstate.islast
+    var table perfTable = table.new(position.top_right, 2, 8, border_width=1)
+
+    totalTrades   = strategy.closedtrades
+    winTrades     = strategy.wintrades
+    lossTrades    = strategy.losstrades
+    winRate       = totalTrades > 0 ? (winTrades / totalTrades) * 100 : 0
+    netProfit     = strategy.netprofit
+    netProfitPct  = (strategy.netprofit / strategy.initial_capital) * 100
+    profitFactor  = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    maxDD         = strategy.max_drawdown
+    maxDDPct      = (strategy.max_drawdown / strategy.initial_capital) * 100
+    avgTrade      = totalTrades > 0 ? strategy.netprofit / totalTrades : 0
+    openPos       = strategy.position_size > 0 ? "Long" : strategy.position_size < 0 ? "Short" : "Flat"
+
+    table.cell(perfTable, 0, 0, "Metric", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 0, "Value", bgcolor=color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 1, "Net Profit", text_size=size.small)
+    table.cell(perfTable, 1, 1, str.tostring(netProfit, "#.##") + " (" + str.tostring(netProfitPct, "#.##") + "%)",
+         text_color=netProfit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 2, "Total Trades", text_size=size.small)
+    table.cell(perfTable, 1, 2, str.tostring(totalTrades), text_size=size.small)
+
+    table.cell(perfTable, 0, 3, "Win Rate", text_size=size.small)
+    table.cell(perfTable, 1, 3, str.tostring(winRate, "#.##") + "%", text_size=size.small)
+
+    table.cell(perfTable, 0, 4, "Profit Factor", text_size=size.small)
+    table.cell(perfTable, 1, 4, na(profitFactor) ? "N/A" : str.tostring(profitFactor, "#.##"), text_size=size.small)
+
+    table.cell(perfTable, 0, 5, "Max Drawdown", text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(maxDD, "#.##") + " (" + str.tostring(maxDDPct, "#.##") + "%)",
+         text_color=color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 6, "Avg Trade P&L", text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(avgTrade, "#.##"), text_size=size.small)
+
+    table.cell(perfTable, 0, 7, "Current Position", text_size=size.small)
+    table.cell(perfTable, 1, 7, openPos,
+         text_color=openPos == "Long" ? color.green : openPos == "Short" ? color.red : color.gray, text_size=size.small)

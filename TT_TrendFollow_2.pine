@@ -1,0 +1,217 @@
+//@version=5
+strategy(
+     title              = "Trader Tom - Trend Following",
+     shorttitle         = "TT_TrendFollow",
+     overlay            = true,
+     default_qty_type   = strategy.cash,
+     default_qty_value  = 1000,
+     initial_capital    = 10000,
+     currency           = currency.USD,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.1,
+     slippage           = 2,
+     calc_on_every_tick = false
+)
+
+// ============================================================
+// INPUTS
+// ============================================================
+
+grpTrend       = "Trend Filter"
+i_maLength     = input.int(89, "MA Length", minval=1, group=grpTrend)
+i_maType       = input.string("EMA", "MA Type", options=["EMA", "SMA"], group=grpTrend)
+i_use3BarSwing = input.bool(true, "3-Bar Swing Confirmation", group=grpTrend)
+
+grpEntry    = "Entry Signal"
+i_entryMode = input.string("Engulfing", "Entry Signal", options=["Engulfing", "4-Bar Fractal", "Both (Either)"], group=grpEntry)
+
+grpRisk   = "Risk Management"
+i_riskPct = input.float(1.0, "Risk per Trade (%)", minval=0.1, maxval=10.0, step=0.1, group=grpRisk)
+i_useRR   = input.bool(false, "Use Fixed R:R Target", group=grpRisk)
+i_rrRatio = input.float(2.0, "R:R Ratio", minval=0.5, maxval=20.0, step=0.5, group=grpRisk)
+
+grpExit    = "Exit Settings"
+i_useTrail = input.bool(true, "Use ATR Trailing Stop", group=grpExit)
+i_atrLen   = input.int(14, "ATR Length", minval=1, group=grpExit)
+i_atrMult  = input.float(2.0, "ATR Trail Multiplier", minval=0.5, maxval=10.0, step=0.25, group=grpExit)
+
+grpViz        = "Visuals"
+i_showMA      = input.bool(true, "Show 89 MA", group=grpViz)
+i_showBG      = input.bool(true, "Show Trend Background", group=grpViz)
+i_showSignals = input.bool(true, "Show Entry Signals", group=grpViz)
+i_showStop    = input.bool(true, "Show Active Stop Level", group=grpViz)
+
+// ============================================================
+// TREND FILTER
+// ============================================================
+
+float ma89 = switch i_maType
+    "EMA" => ta.ema(close, i_maLength)
+    "SMA" => ta.sma(close, i_maLength)
+    => ta.ema(close, i_maLength)
+
+bool maTrendUp   = close > ma89
+bool maTrendDown = close < ma89
+
+float threeBarHigh = ta.highest(high, 3)[1]
+float threeBarLow  = ta.lowest(low, 3)[1]
+
+var bool swingBullish = false
+var bool swingBearish = false
+
+if close > threeBarHigh
+    swingBullish := true
+    swingBearish := false
+else if close < threeBarLow
+    swingBullish := false
+    swingBearish := true
+
+bool trendUp   = maTrendUp and (i_use3BarSwing ? swingBullish : true)
+bool trendDown = maTrendDown and (i_use3BarSwing ? swingBearish : true)
+
+// ============================================================
+// PATTERN DETECTION
+// ============================================================
+
+bool priorBearish   = close[1] < open[1]
+bool currBullish    = close > open
+bool bullBodyCovers = open <= close[1] and close >= open[1]
+bool bullEngulf     = currBullish and priorBearish and bullBodyCovers
+
+bool priorBullish   = close[1] > open[1]
+bool currBearish    = close < open
+bool bearBodyCovers = open >= close[1] and close <= open[1]
+bool bearEngulf     = currBearish and priorBullish and bearBodyCovers
+
+// 4-Bar Fractal: current close must clear the high/low of all three preceding bars,
+// not just the 1-back and 3-back ones.
+bool fractalBuy  = close > high[1] and close > high[2] and close > high[3]
+bool fractalSell = close < low[1] and close < low[2] and close < low[3]
+
+bool rawLongSig = switch i_entryMode
+    "Engulfing"     => bullEngulf
+    "4-Bar Fractal" => fractalBuy
+    "Both (Either)" => bullEngulf or fractalBuy
+    => false
+
+bool rawShortSig = switch i_entryMode
+    "Engulfing"     => bearEngulf
+    "4-Bar Fractal" => fractalSell
+    "Both (Either)" => bearEngulf or fractalSell
+    => false
+
+// ============================================================
+// STOP-LOSS LEVELS
+// ============================================================
+
+float proposedLongStop  = low - syminfo.mintick
+float proposedShortStop = high + syminfo.mintick
+float proposedLongDist  = close - proposedLongStop
+float proposedShortDist = proposedShortStop - close
+
+bool longStopValid  = proposedLongDist > syminfo.mintick * 2
+bool shortStopValid = proposedShortDist > syminfo.mintick * 2
+
+// ============================================================
+// POSITION SIZING
+// ============================================================
+
+float equityRisk = strategy.equity * (i_riskPct / 100.0)
+
+float calcLongQty = longStopValid and proposedLongDist > 0 and syminfo.pointvalue > 0 ? equityRisk / (proposedLongDist * syminfo.pointvalue) : 1.0
+
+float calcShortQty = shortStopValid and proposedShortDist > 0 and syminfo.pointvalue > 0 ? equityRisk / (proposedShortDist * syminfo.pointvalue) : 1.0
+
+// Spot-mode-safe ceiling: position value can never exceed 100% of equity, no matter how
+// tight the stop distance is. This cap is unconditional. It sits as the outer math.min,
+// so it always wins over the 1.0 floor even when the floor would otherwise push a
+// high-priced instrument's quantity above what the account can actually support.
+float spotSafeLongCap  = close > 0 ? strategy.equity / close : 1e15
+float spotSafeShortCap = close > 0 ? strategy.equity / close : 1e15
+
+float longQty  = math.min(math.max(calcLongQty, 1.0), spotSafeLongCap)
+float shortQty = math.min(math.max(calcShortQty, 1.0), spotSafeShortCap)
+
+// ============================================================
+// ENTRY
+// ============================================================
+
+var float lockedLongStop  = na
+var float lockedShortStop = na
+var float lockedLongDist  = na
+var float lockedShortDist = na
+
+bool canLong  = strategy.opentrades == 0 and trendUp and rawLongSig and longStopValid
+bool canShort = strategy.opentrades == 0 and trendDown and rawShortSig and shortStopValid
+
+if canLong
+    lockedLongStop := proposedLongStop
+    lockedLongDist := proposedLongDist
+    strategy.entry("Long", strategy.long, qty=longQty, comment="L|" + i_entryMode)
+
+if canShort
+    lockedShortStop := proposedShortStop
+    lockedShortDist := proposedShortDist
+    strategy.entry("Short", strategy.short, qty=shortQty, comment="S|" + i_entryMode)
+
+// ============================================================
+// EXIT
+// ============================================================
+
+float atr14      = ta.atr(i_atrLen)
+int   trailTicks = math.max(1, math.round((atr14 * i_atrMult) / syminfo.mintick))
+
+if strategy.position_size > 0
+    float tpLong = not na(lockedLongDist) and i_useRR ? strategy.position_avg_price + lockedLongDist * i_rrRatio : na
+    strategy.exit(
+         "Long Exit", "Long",
+         stop         = lockedLongStop,
+         limit        = i_useRR ? tpLong : na,
+         trail_points = i_useTrail ? 0 : na,
+         trail_offset = i_useTrail ? trailTicks : na
+    )
+
+if strategy.position_size < 0
+    float tpShort = not na(lockedShortDist) and i_useRR ? strategy.position_avg_price - lockedShortDist * i_rrRatio : na
+    strategy.exit(
+         "Short Exit", "Short",
+         stop         = lockedShortStop,
+         limit        = i_useRR ? tpShort : na,
+         trail_points = i_useTrail ? 0 : na,
+         trail_offset = i_useTrail ? trailTicks : na
+    )
+
+// Mode-aware reversal close: exits on the opposite-direction raw signal for whichever
+// Entry Signal mode is selected, so exits stay consistent with entries.
+if strategy.position_size > 0 and rawShortSig
+    strategy.close("Long", comment="Reversal")
+
+if strategy.position_size < 0 and rawLongSig
+    strategy.close("Short", comment="Reversal")
+
+// ============================================================
+// ALERTS
+// ============================================================
+
+alertcondition(canLong, "Long Entry", "TT Long | {{ticker}} | {{interval}}")
+alertcondition(canShort, "Short Entry", "TT Short | {{ticker}} | {{interval}}")
+alertcondition(strategy.position_size[1] > 0 and strategy.position_size == 0, "Long Closed", "TT Long Closed | {{ticker}}")
+alertcondition(strategy.position_size[1] < 0 and strategy.position_size == 0, "Short Closed", "TT Short Closed | {{ticker}}")
+
+// ============================================================
+// VISUALS
+// ============================================================
+
+plot(i_showMA ? ma89 : na, "89 MA", color.new(color.orange, 0), linewidth=2)
+
+bgColorValue = i_showBG and trendUp ? color.new(color.green, 90) : i_showBG and trendDown ? color.new(color.red, 90) : na
+bgcolor(bgColorValue, title="Trend Background")
+
+plotshape(i_showSignals and canLong, "Long Signal", location.belowbar, shape.triangleup, color=color.new(color.lime, 0), size=size.normal)
+plotshape(i_showSignals and canShort, "Short Signal", location.abovebar, shape.triangledown, color=color.new(color.red, 0), size=size.normal)
+
+float stopPlot = strategy.position_size > 0 ? lockedLongStop : strategy.position_size < 0 ? lockedShortStop : na
+plot(i_showStop ? stopPlot : na, "Active Stop", color.new(color.red, 20), linewidth=1, style=plot.style_linebr)
+
+barColorValue = trendUp ? color.new(color.green, 70) : trendDown ? color.new(color.red, 70) : na
+barcolor(barColorValue, title="Trend Bar Color")

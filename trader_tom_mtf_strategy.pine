@@ -1,0 +1,445 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+
+// =============================================================================================
+// TRADER TOM MULTI-TIMEFRAME SYSTEM — BTC / ETH / XAUUSD
+// =============================================================================================
+// Adapted from Trader Tom's "First Trading Manual" (sole core methodology, per approved Phase 1
+// scope). Applied to BTC/USD, ETH/USD and XAUUSD via leveraged derivatives (WEEX), bidirectional,
+// dual-mode (Swing / Day-Trade), per the approved Phase 2-4 trader profile and architecture.
+//
+// IMPORTANT — READ BEFORE USE:
+//   1. This script implements ONE instrument's ruleset per chart. Apply it to a BTC, ETH, or
+//      XAUUSD chart and set "Instrument Type" below to match. It does not auto-detect the symbol.
+//   2. Several elements of Tom's manual are qualitative/discretionary with no numeric threshold
+//      given in the source text (candlestick body/wick ratios, the Fake-Out/Fake-Down distance,
+//      the Divergence Strategy's oscillator, the Harmonic Retracement ratio). Every such element
+//      is implemented here as a clearly-labeled, TA-industry-standard mechanical PROXY per your
+//      explicit Phase 2/4 decisions — NOT Tom's literal text. Search "INTERPRETATION" in comments
+//      below for every instance.
+//   3. Position-size minimums/maximums are NOT auto-detected from WEEX. You must set the
+//      "Minimum/Maximum Tradeable Quantity" inputs to match the actual contract specs for
+//      whichever instrument this chart represents.
+//   4. All higher-timeframe (weekly/daily) data is pulled using a [1] (prior, CLOSED bar) offset
+//      specifically to avoid repainting on the currently-forming higher-timeframe bar. This is a
+//      deliberate one-bar-lag anti-repaint design choice, not an oversight.
+// =============================================================================================
+
+strategy("Trader Tom MTF System — BTC/ETH/XAU", shorttitle = "TT-MTF", overlay = true,
+     initial_capital = 1000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.percent, commission_value = 0.06,
+     slippage = 2, pyramiding = 2,
+     calc_on_every_tick = false, process_orders_on_close = true,
+     max_bars_back = 2000)
+
+// =============================================================================================
+// INPUTS
+// =============================================================================================
+
+grp_general = "General"
+i_instrument = input.string("BTC", "Instrument Type", options = ["BTC", "ETH", "Gold"], group = grp_general,
+     tooltip = "Selects which instrument-specific rules apply (BTC gate for ETH, session filter for Gold). Does NOT change the chart symbol — apply this script to the matching BTC/ETH/XAUUSD chart.")
+i_mode = input.string("Swing", "Trading Mode", options = ["Swing", "Day-Trade"], group = grp_general,
+     tooltip = "Swing: Weekly bias -> Daily trend -> 4H/1H execution. Day-Trade: Weekly bias -> Daily trend -> 15min execution. Apply this script to a chart at the relevant EXECUTION timeframe for your chosen mode.")
+i_maType = input.string("SMA", "89-Period MA Type", options = ["SMA", "EMA"], group = grp_general,
+     tooltip = "INTERPRETATION: Tom's manual does not specify SMA vs EMA. Defaulting to SMA.")
+
+grp_risk = "Risk Management"
+i_riskPerTrade = input.float(1.0, "Risk Per Trade (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_risk)
+i_maxDailyLossPct = input.float(2.0, "Max Daily Loss (%)", minval = 0.5, maxval = 20.0, step = 0.5, group = grp_risk,
+     tooltip = "Not specified in Tom's manual — genuine risk-guardrail preference per your Phase 2 answer.")
+
+grp_sizing = "Position Sizing Guardrails"
+i_minQty = input.float(0.001, "Minimum Tradeable Quantity", minval = 0.0, step = 0.001, group = grp_sizing,
+     tooltip = "SET THIS to WEEX's actual minimum contract size for this instrument. Not auto-detected.")
+i_maxQty = input.float(1000000.0, "Maximum Tradeable Quantity (safety cap)", minval = 0.0, group = grp_sizing)
+
+grp_trend = "Trend Definition"
+i_maLen = input.int(89, "MA Length", minval = 10, maxval = 300, group = grp_trend)
+i_swingBarsN = input.int(3, "3-Bar Swing Rule Lookback", minval = 2, maxval = 10, group = grp_trend)
+
+grp_confirm = "Entry Confirmation (Candlesticks)"
+i_useCandlestick = input.bool(true, "Require Candlestick Confirmation", group = grp_confirm)
+i_dojiThresh = input.float(10.0, "Doji Body Threshold (% of range)", minval = 1.0, maxval = 25.0, group = grp_confirm,
+     tooltip = "INTERPRETATION: no numeric threshold given in source text.")
+i_stdBodyThresh = input.float(70.0, "Standard Pattern Body Threshold (% of range)", minval = 50.0, maxval = 95.0, group = grp_confirm)
+i_wickRatio = input.float(2.0, "Hammer/Star Wick-to-Body Ratio", minval = 1.5, maxval = 4.0, group = grp_confirm)
+
+grp_fakeout = "Fake-Out / Fake-Down"
+i_useFakeout = input.bool(true, "Require Fake-Out/Fake-Down Confirmation", group = grp_fakeout,
+     tooltip = "INTERPRETATION (per your decision): wick beyond a 20-bar high/low that closes back inside on the SAME bar.")
+i_fakeoutLookback = input.int(20, "Fake-Out Level Lookback (bars)", minval = 5, maxval = 100, group = grp_fakeout)
+
+grp_div = "Divergence Strategy (Optional)"
+i_useDivergence = input.bool(false, "Enable Divergence Filter", group = grp_div,
+     tooltip = "INTERPRETATION (per your decision): RSI-price divergence proxy — Tom's text names no oscillator. Off by default. Informational only, does not block entries.")
+i_rsiLen = input.int(14, "RSI Length", minval = 2, maxval = 50, group = grp_div)
+
+grp_harmonic = "Harmonic Retracement (Swing Mode Only)"
+i_useHarmonic = input.bool(true, "Enable Harmonic Retracement Projection", group = grp_harmonic,
+     tooltip = "Per your decision: equal-distance projection (literal reading of Tom's example), informational/visual only.")
+
+grp_btc = "BTC Correlation Gate (ETH Only)"
+i_btcSymbol = input.symbol("BINANCE:BTCUSDT", "BTC Reference Symbol", group = grp_btc,
+     tooltip = "Active only when Instrument Type = ETH. Point to whichever BTC/USD feed is available on your TradingView plan. NOTE: uses BTC's weekly MA position as a simplified proxy for 'BTC's own trend' — see script header.")
+
+grp_session = "Session Filter (Gold Only)"
+i_sessionStart1 = input.session("0800-1030", "European Session (GMT)", group = grp_session)
+i_sessionStart2 = input.session("1330-1630", "US Session (GMT)", group = grp_session)
+
+grp_visual = "Visuals"
+i_showStructure = input.bool(true, "Show Swing/Structure Labels", group = grp_visual)
+i_showMA = input.bool(true, "Show 89 MA (chart timeframe)", group = grp_visual)
+i_showFakeout = input.bool(true, "Show Fake-Out/Fake-Down Markers", group = grp_visual)
+
+// =============================================================================================
+// SHARED SWING-POINT / 4-BAR FRACTAL DETECTOR
+// Per Tom's exact rule. Reused (per your Phase 4 decision) as the general swing-point detector
+// feeding structure labeling, stop placement, trailing, and break-even — one function, one
+// definition, used everywhere, resolving the ABCD swing-point ambiguity flagged in Phase 1.
+// =============================================================================================
+
+fractalBuy  = close > high[1] and close > high[3]
+fractalSell = close < low[1]  and close < low[3]
+
+swingHighValue = math.max(high[1], high[3])   // the reference swing high a fractalSell breaks
+swingLowValue  = math.min(low[1],  low[3])    // the reference swing low a fractalBuy breaks
+
+// =============================================================================================
+// TREND DEFINITION — TOOL 1: 89-PERIOD MA (WEEKLY BIAS)
+// =============================================================================================
+
+weeklyMA    = request.security(syminfo.tickerid, "W", i_maType == "SMA" ? ta.sma(close, i_maLen)[1] : ta.ema(close, i_maLen)[1], lookahead = barmerge.lookahead_off)
+weeklyClose = request.security(syminfo.tickerid, "W", close[1], lookahead = barmerge.lookahead_off)
+maTrendUp   = weeklyClose > weeklyMA
+maTrendDown = weeklyClose < weeklyMA
+
+// =============================================================================================
+// TREND DEFINITION — TOOL 2: 3-BAR SWING RULE (DAILY)
+// =============================================================================================
+
+dailyHigh3 = request.security(syminfo.tickerid, "D", ta.highest(high, i_swingBarsN)[1], lookahead = barmerge.lookahead_off)
+dailyLow3  = request.security(syminfo.tickerid, "D", ta.lowest(low, i_swingBarsN)[1], lookahead = barmerge.lookahead_off)
+dailyClose = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_off)
+swingRuleNotBroken_Up   = dailyClose > dailyLow3    // has not broken the 3-bar low
+swingRuleNotBroken_Down = dailyClose < dailyHigh3   // has not broken the 3-bar high
+
+// =============================================================================================
+// TREND DEFINITION — TOOL 3: STRICT TREND-CHANGE STATE MACHINE
+// Up -> Down requires: Lower High forms (warning) -> Lower Low forms (still warning) -> close
+// breaks below that Lower Low (confirmed). LH+LL WITHOUT the break = ABCD, warning resets, trend
+// intact. Mirror logic for Down -> Up.
+// =============================================================================================
+
+var string trendDir  = "none"
+var string warnState = "none"
+var float  warnLevelLL = na
+var float  warnLevelHH = na
+
+var float lastSwingHigh = na
+var float prevSwingHigh = na
+var float lastSwingLow  = na
+var float prevSwingLow  = na
+var bool  isHigherHigh  = na
+var bool  isLowerHigh   = na
+var bool  isHigherLow   = na
+var bool  isLowerLow    = na
+
+if fractalSell
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := swingHighValue
+    if not na(prevSwingHigh)
+        isHigherHigh := lastSwingHigh > prevSwingHigh
+        isLowerHigh  := lastSwingHigh < prevSwingHigh
+
+if fractalBuy
+    prevSwingLow := lastSwingLow
+    lastSwingLow := swingLowValue
+    if not na(prevSwingLow)
+        isHigherLow := lastSwingLow > prevSwingLow
+        isLowerLow  := lastSwingLow < prevSwingLow
+
+// Bootstrap: establish an initial trend once enough swing data exists
+if trendDir == "none" and not na(isHigherHigh) and not na(isHigherLow)
+    trendDir := isHigherHigh or isHigherLow ? "up" : "down"
+
+// Up -> Down sequence
+if fractalSell and trendDir == "up" and isLowerHigh
+    warnState := "lh_formed"
+
+if fractalBuy and trendDir == "up" and (warnState == "lh_formed" or warnState == "lh_then_ll_formed")
+    if isLowerLow
+        warnState   := "lh_then_ll_formed"
+        warnLevelLL := lastSwingLow
+    else if warnState == "lh_formed"
+        warnState := "none"   // higher low instead -> ABCD, warning resets, uptrend intact
+
+if trendDir == "up" and warnState == "lh_then_ll_formed" and close < warnLevelLL
+    trendDir  := "down"
+    warnState := "none"
+
+// Down -> Up sequence (mirror)
+if fractalBuy and trendDir == "down" and isHigherLow
+    warnState := "hl_formed"
+
+if fractalSell and trendDir == "down" and (warnState == "hl_formed" or warnState == "hl_then_hh_formed")
+    if isHigherHigh
+        warnState   := "hl_then_hh_formed"
+        warnLevelHH := lastSwingHigh
+    else if warnState == "hl_formed"
+        warnState := "none"
+
+if trendDir == "down" and warnState == "hl_then_hh_formed" and close > warnLevelHH
+    trendDir  := "up"
+    warnState := "none"
+
+// =============================================================================================
+// COMBINED TREND (per your Phase 2 decision: 89MA + 3-Bar Rule + strict sequence must all agree)
+// =============================================================================================
+
+combinedTrendUp   = trendDir == "up"   and maTrendUp   and swingRuleNotBroken_Up
+combinedTrendDown = trendDir == "down" and maTrendDown and swingRuleNotBroken_Down
+
+// =============================================================================================
+// CANDLESTICK PATTERN PROXIES
+// INTERPRETATION: standard TA-industry OHLC-ratio definitions. Tom's manual gives no numeric
+// thresholds for any of these — this is a mechanical translation, not his literal text.
+// =============================================================================================
+
+bodySize  = math.abs(close - open)
+rangeSize = high - low
+upWick    = high - math.max(open, close)
+lowWick   = math.min(open, close) - low
+bodyPct   = rangeSize > 0 ? (bodySize / rangeSize) * 100 : 0
+
+isDoji          = bodyPct <= i_dojiThresh and rangeSize > 0
+isStandardBull  = close > open and bodyPct >= i_stdBodyThresh
+isStandardBear  = close < open and bodyPct >= i_stdBodyThresh
+
+recentDownCtx = close[1] < close[5]
+recentUpCtx   = close[1] > close[5]
+isNewHigh10   = high >= ta.highest(high, 10)[1]
+
+isUmbrellaShape  = lowWick >= bodySize * i_wickRatio and upWick <= bodySize * 0.5 and bodyPct <= 35
+isInvertedShape  = upWick  >= bodySize * i_wickRatio and lowWick <= bodySize * 0.5 and bodyPct <= 35
+
+isHammer         = isUmbrellaShape and recentDownCtx
+isHangingMan     = isUmbrellaShape and recentUpCtx
+isShootingStar   = isInvertedShape and recentUpCtx and isNewHigh10   // Tom: "only on a new high"
+isInvertedHammer = isInvertedShape and recentDownCtx
+
+isGravestoneDoji  = isDoji and lowWick <= bodySize * 0.3 + 0.0000001 and upWick > rangeSize * 0.6
+isDragonflyDoji   = isDoji and upWick  <= bodySize * 0.3 + 0.0000001 and lowWick > rangeSize * 0.6
+isLongLeggedDoji  = isDoji and upWick > rangeSize * 0.25 and lowWick > rangeSize * 0.25
+
+isBullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+isBearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+
+candleConfirmBull = isHammer or isDragonflyDoji or isInvertedHammer or isBullEngulf or isStandardBull
+candleConfirmBear = isHangingMan or isGravestoneDoji or isShootingStar or isBearEngulf or isStandardBear
+
+// =============================================================================================
+// FAKE-OUT / FAKE-DOWN
+// INTERPRETATION (per your decision): same-bar wick beyond a recent level that closes back inside.
+// =============================================================================================
+
+recentHighLevel = ta.highest(high, i_fakeoutLookback)[1]
+recentLowLevel  = ta.lowest(low,  i_fakeoutLookback)[1]
+
+fakeOut  = high > recentHighLevel and close < recentHighLevel   // bearish signal
+fakeDown = low  < recentLowLevel  and close > recentLowLevel    // bullish signal
+
+// =============================================================================================
+// DIVERGENCE STRATEGY (optional, off by default, informational only)
+// INTERPRETATION: RSI-price divergence proxy. Tom's text names no oscillator/rule.
+// =============================================================================================
+
+rsiVal = ta.rsi(close, i_rsiLen)
+
+var float prevPriceLow  = na
+var float prevRsiLow    = na
+var float prevPriceHigh = na
+var float prevRsiHigh   = na
+bullishDiv = false
+bearishDiv = false
+
+if i_useDivergence
+    if fractalBuy
+        if not na(prevPriceLow) and swingLowValue < prevPriceLow and rsiVal > prevRsiLow
+            bullishDiv := true
+        prevPriceLow := swingLowValue
+        prevRsiLow   := rsiVal
+    if fractalSell
+        if not na(prevPriceHigh) and swingHighValue > prevPriceHigh and rsiVal < prevRsiHigh
+            bearishDiv := true
+        prevPriceHigh := swingHighValue
+        prevRsiHigh   := rsiVal
+
+// =============================================================================================
+// HARMONIC RETRACEMENT (Swing mode only, equal-distance projection, informational/visual only)
+// Per David's case study in Tom's manual — a literal equal-distance reading, not a Fibonacci ratio.
+// =============================================================================================
+
+var float harmonicProjection = na
+
+if i_useHarmonic and i_mode == "Swing" and fractalBuy and not na(prevSwingLow) and not na(lastSwingHigh)
+    priorLegSize := 0.0
+    priorLegSize := lastSwingHigh - prevSwingLow
+    harmonicProjection := lastSwingHigh - priorLegSize
+
+// =============================================================================================
+// BTC CORRELATION GATE (active only when Instrument Type = ETH)
+// NOTE: replicating the FULL 89MA+3-Bar+sequence trend-definition for a cross-requested second
+// symbol adds significant complexity and repaint-risk surface area. This gate uses BTC's own
+// weekly-MA position as a simplified, directionally-consistent proxy for "BTC's trend" — the
+// same MA-based bias tool used elsewhere in this script.
+// =============================================================================================
+
+btcWeeklyClose = request.security(i_btcSymbol, "W", close[1], lookahead = barmerge.lookahead_off)
+btcWeeklyMA    = request.security(i_btcSymbol, "W", i_maType == "SMA" ? ta.sma(close, i_maLen)[1] : ta.ema(close, i_maLen)[1], lookahead = barmerge.lookahead_off)
+btcTrendUp     = btcWeeklyClose > btcWeeklyMA
+
+btcGateOk(isLong) =>
+    i_instrument != "ETH" or (isLong and btcTrendUp) or (not isLong and not btcTrendUp)
+
+// =============================================================================================
+// SESSION FILTER (Gold only)
+// Simplified to Tom's two broadest stated high-activity windows.
+// =============================================================================================
+
+inEuropeanSession = not na(time(timeframe.period, i_sessionStart1, "GMT"))
+inUSSession       = not na(time(timeframe.period, i_sessionStart2, "GMT"))
+sessionGateOk     = i_instrument != "Gold" or inEuropeanSession or inUSSession
+
+// =============================================================================================
+// CONFLUENCE — FULL STACK REQUIRED (trend + fractal + candlestick + instrument gates)
+// Optional Fake-Out/Fake-Down acts as an ADDITIONAL required confirming layer when enabled.
+// =============================================================================================
+
+longConfluence  = fractalBuy  and combinedTrendUp   and (not i_useCandlestick or candleConfirmBull) and btcGateOk(true)  and sessionGateOk and (not i_useFakeout or fakeDown)
+shortConfluence = fractalSell and combinedTrendDown and (not i_useCandlestick or candleConfirmBear) and btcGateOk(false) and sessionGateOk and (not i_useFakeout or fakeOut)
+
+// =============================================================================================
+// POSITION SIZING (risk% x current equity / structure-based stop distance, with guardrails)
+// =============================================================================================
+
+longStopPrice  = swingLowValue
+shortStopPrice = swingHighValue
+
+f_calcQty(entryPrice, stopPrice, riskPct) =>
+    stopDistance = math.abs(entryPrice - stopPrice)
+    riskAmount   = strategy.equity * (riskPct / 100)
+    stopDistance > 0 ? riskAmount / stopDistance : na
+
+longQty  = f_calcQty(close, longStopPrice, i_riskPerTrade)
+shortQty = f_calcQty(close, shortStopPrice, i_riskPerTrade)
+
+qtyValid(q) => not na(q) and q >= i_minQty and q <= i_maxQty
+
+// =============================================================================================
+// RISK MANAGEMENT — DAILY LOSS CAP
+// =============================================================================================
+
+var float dayStartEquity = na
+var bool  dailyLossHit   = false
+
+newDay = ta.change(time("D")) != 0
+if newDay
+    dayStartEquity := strategy.equity
+    dailyLossHit   := false
+
+if not na(dayStartEquity) and strategy.equity <= dayStartEquity * (1 - i_maxDailyLossPct / 100)
+    dailyLossHit := true
+
+canTradeToday   = not dailyLossHit
+noOpenPosition  = strategy.position_size == 0
+
+// =============================================================================================
+// TRADE EXECUTION — ENTRY
+// =============================================================================================
+
+canEnterLong  = combinedTrendUp   and longConfluence  and canTradeToday and noOpenPosition and qtyValid(longQty)
+canEnterShort = combinedTrendDown and shortConfluence and canTradeToday and noOpenPosition and qtyValid(shortQty)
+
+if canEnterLong
+    strategy.entry("Long", strategy.long, qty = longQty)
+    strategy.exit("Long Stop", from_entry = "Long", stop = longStopPrice)
+
+if canEnterShort
+    strategy.entry("Short", strategy.short, qty = shortQty)
+    strategy.exit("Short Stop", from_entry = "Short", stop = shortStopPrice)
+
+// =============================================================================================
+// TRADE MANAGEMENT — BREAK-EVEN, TRAILING (structure-based), SCALE-IN (no scale-out)
+// =============================================================================================
+
+var float activeStopLevel   = na
+var float entryPriceRecord  = na
+var bool  scaledIn          = false
+
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    entryPriceRecord := strategy.position_avg_price
+    activeStopLevel  := longStopPrice
+    scaledIn         := false
+
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    entryPriceRecord := strategy.position_avg_price
+    activeStopLevel  := shortStopPrice
+    scaledIn         := false
+
+// Break-even: new confirming swing point forms in favor of the open trade
+if strategy.position_size > 0 and fractalBuy and isHigherLow and not na(lastSwingLow) and lastSwingLow > entryPriceRecord and lastSwingLow > activeStopLevel
+    activeStopLevel := lastSwingLow > entryPriceRecord ? entryPriceRecord : activeStopLevel
+    strategy.exit("Long Stop", from_entry = "Long", stop = activeStopLevel)
+
+if strategy.position_size < 0 and fractalSell and isLowerHigh and not na(lastSwingHigh) and lastSwingHigh < entryPriceRecord and lastSwingHigh < activeStopLevel
+    activeStopLevel := lastSwingHigh < entryPriceRecord ? entryPriceRecord : activeStopLevel
+    strategy.exit("Short Stop", from_entry = "Short", stop = activeStopLevel)
+
+// Trailing: once at/beyond break-even, continue ratcheting behind subsequent swing points
+if strategy.position_size > 0 and not na(lastSwingLow) and lastSwingLow > activeStopLevel and activeStopLevel >= entryPriceRecord and fractalBuy
+    activeStopLevel := lastSwingLow
+    strategy.exit("Long Stop", from_entry = "Long", stop = activeStopLevel)
+
+if strategy.position_size < 0 and not na(lastSwingHigh) and lastSwingHigh < activeStopLevel and activeStopLevel <= entryPriceRecord and fractalSell
+    activeStopLevel := lastSwingHigh
+    strategy.exit("Short Stop", from_entry = "Short", stop = activeStopLevel)
+
+// Scale-in: add to winners once break-even is achieved (no scale-out, per your decision)
+if strategy.position_size > 0 and activeStopLevel >= entryPriceRecord and not scaledIn and longConfluence and combinedTrendUp and qtyValid(longQty)
+    strategy.entry("Long", strategy.long, qty = longQty)
+    scaledIn := true
+
+if strategy.position_size < 0 and activeStopLevel <= entryPriceRecord and not scaledIn and shortConfluence and combinedTrendDown and qtyValid(shortQty)
+    strategy.entry("Short", strategy.short, qty = shortQty)
+    scaledIn := true
+
+// =============================================================================================
+// ALERTS
+// =============================================================================================
+
+alertcondition(canEnterLong,  title = "Long Entry",        message = "TT-MTF: Long entry signal")
+alertcondition(canEnterShort, title = "Short Entry",       message = "TT-MTF: Short entry signal")
+alertcondition(dailyLossHit and dailyLossHit[1] == false, title = "Max Daily Loss Hit", message = "TT-MTF: Max daily loss reached — no further entries today")
+alertcondition(bullishDiv, title = "Bullish Divergence",   message = "TT-MTF: Bullish RSI divergence detected")
+alertcondition(bearishDiv, title = "Bearish Divergence",   message = "TT-MTF: Bearish RSI divergence detected")
+
+// =============================================================================================
+// VISUALS
+// =============================================================================================
+
+plot(i_showMA ? ta.sma(close, i_maLen) : na, title = "MA (chart TF context)", color = color.new(color.orange, 0), linewidth = 2)
+
+plotshape(i_showStructure and fractalBuy,  title = "Swing Low",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0),   size = size.tiny)
+plotshape(i_showStructure and fractalSell, title = "Swing High", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),    size = size.tiny)
+
+plotshape(canEnterLong,  title = "Long Entry",  style = shape.labelup,   location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, text = "L", size = size.small)
+plotshape(canEnterShort, title = "Short Entry", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0),   textcolor = color.white, text = "S", size = size.small)
+
+plotshape(i_showFakeout and fakeOut,  title = "Fake-Out",  style = shape.xcross, location = location.abovebar, color = color.new(color.fuchsia, 0), size = size.tiny)
+plotshape(i_showFakeout and fakeDown, title = "Fake-Down", style = shape.xcross, location = location.belowbar, color = color.new(color.aqua, 0),     size = size.tiny)
+
+bgcolor(i_instrument == "Gold" and not sessionGateOk ? color.new(color.gray, 90) : na, title = "Outside Gold Session")
+
+plot(i_useHarmonic and i_mode == "Swing" ? harmonicProjection : na, title = "Harmonic Projection", color = color.new(color.purple, 0), style = plot.style_circles, linewidth = 2)

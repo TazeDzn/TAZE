@@ -1,0 +1,631 @@
+//@version=5
+
+// =============================================================================
+// CRT Multi-Timeframe Liquidity Sweep Strategy
+// =============================================================================
+// Implements the 3-candle CRT (Candle Range Theory) liquidity-sweep model:
+//   1. Reference Candle - a completed anchor-timeframe candle (1H during the
+//      New York session, 15m during the Asian/London session).
+//   2. Middle Candle    - the very next anchor-timeframe candle. It must
+//      sweep ONE side of the Reference Candle's wick range and close back
+//      inside it. Piercing BOTH sides in the same candle invalidates the setup.
+//   3. Entry Trigger     - on the chart's own (lower) timeframe, the exact
+//      break of the Middle Candle's opposite extreme.
+//
+// Trades are only taken in the direction of the daily-timeframe swing
+// structure (higher-highs/higher-lows = bullish only, lower-highs/lower-lows
+// = bearish only). Target is the opposite extreme of the Reference Candle;
+// the stop is back-solved from that target to hold a 1.5R-2.0R ratio.
+//
+// INTENDED USE: load this script on a 1-minute or 2-minute chart. The chart's
+// own timeframe IS the entry-trigger timeframe. 1H / 15m / 30m / Daily data
+// are all pulled via request.security() regardless of what the chart shows.
+// =============================================================================
+
+strategy("CRT Multi-Timeframe Liquidity Sweep", shorttitle = "CRT MTF", overlay = true,
+     initial_capital = 10000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     pyramiding = 0,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.0,
+     slippage = 1,
+     max_boxes_count = 150, max_lines_count = 100, max_labels_count = 300)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+grp_sess = "Session & Anchor Timeframe"
+i_nySession    = input.session("0930-1300", "New York Session", group = grp_sess)
+i_nyTz         = input.string("America/New_York", "New York Session Timezone", group = grp_sess)
+i_anchorNY     = input.timeframe("60", "NY Anchor Timeframe", group = grp_sess)
+i_alSession    = input.session("1900-2200", "Asian / London Session", group = grp_sess)
+i_alTz         = input.string("America/New_York", "Asian/London Session Timezone", group = grp_sess,
+     tooltip = "The brief specifies both session windows in EST clock time, so both default to America/New_York. Change this if you mean the Asian/London window in a different local timezone.")
+i_anchorAL     = input.timeframe("15", "Asian/London Anchor Timeframe", group = grp_sess)
+i_confluenceTF = input.timeframe("30", "30m Confluence Timeframe", group = grp_sess)
+
+grp_bias = "Daily Trend Bias"
+i_dailySwingLB = input.int(3, "Daily Swing Lookback (bars, each side)", minval = 1, group = grp_bias,
+     tooltip = "A daily swing high/low needs this many lower/higher daily bars on BOTH sides to confirm. Market structure = the last two confirmed swing highs and the last two confirmed swing lows, compared in sequence.")
+
+grp_crt = "CRT Setup"
+i_requireCloseConfirm = input.bool(false, "Require Lower-TF CLOSE Beyond Level (stricter, laggier entry)", group = grp_crt)
+i_showInvalidated     = input.bool(false, "Show Invalidated Sweep Attempts (both sides swept)", group = grp_crt)
+
+grp_conf = "30m Confluence"
+i_requireConfluence = input.bool(false, "Require 30m Confluence to Trade (A+ setups only)", group = grp_conf,
+     tooltip = "Definition used: at the moment the sweep confirms, the most recently confirmed 30m candle also pierced the same reference level in the same direction. Off by default - treated as a soft quality tag, not a hard filter, since requiring it can make an already-selective setup fire far less often.")
+
+grp_risk = "Risk Management"
+i_riskPercent      = input.float(1.0, "Risk % of Equity per Trade", minval = 0.01, maxval = 100, step = 0.1, group = grp_risk)
+i_maxContracts     = input.int(10, "Max Contracts / Shares / Units (hard cap)", minval = 1, group = grp_risk,
+     tooltip = "Unconditional ceiling on position size, independent of the risk-based calculation below. Set this to whatever you're actually willing to hold given your account/broker margin.")
+i_rrTight          = input.float(1.5, "R:R to use - Tighter Ranges", minval = 0.1, step = 0.1, group = grp_risk)
+i_rrWide           = input.float(2.0, "R:R to use - Wider/Volatile Ranges", minval = 0.1, step = 0.1, group = grp_risk)
+i_atrLen           = input.int(14, "ATR Length (anchor timeframe)", minval = 1, group = grp_risk)
+i_atrThresholdMult = input.float(1.0, "Tight/Wide Threshold (x ATR)", minval = 0.1, step = 0.1, group = grp_risk,
+     tooltip = "If the Reference Candle's wick-to-wick range is <= this many multiples of anchor-timeframe ATR, it's classified 'tighter' (uses the tighter R:R). Otherwise 'wider/volatile' (uses the wider R:R).")
+i_useManualRR      = input.bool(false, "Override: Always Use a Fixed R:R", group = grp_risk)
+i_manualRR         = input.float(1.5, "Manual Fixed R:R (if override enabled)", minval = 0.1, step = 0.1, group = grp_risk)
+
+grp_trail = "Trade Management"
+i_trailMode = input.string("Conservative (Breakeven at 50%)", "Trailing Stop Mode",
+     options = ["Conservative (Breakeven at 50%)", "Aggressive (Trail Swing Points)"], group = grp_trail)
+i_aggressiveLB = input.int(2, "Aggressive Trail Swing Lookback (chart bars, each side)", minval = 1, group = grp_trail)
+
+grp_vis = "Visuals"
+i_showBoxes        = input.bool(true, "Show Reference/Middle Candle Boxes", group = grp_vis)
+i_showLabels       = input.bool(true, "Show Entry Markers", group = grp_vis)
+i_showTable        = input.bool(true, "Show Info/Diagnostics Table", group = grp_vis)
+i_showSessionRange = input.bool(true, "Show Session High/Low Range", group = grp_vis)
+i_showSweepMarkers = input.bool(true, "Show Sweep Markers", group = grp_vis)
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+// Documented non-repainting HTF pattern (TradingView Pine Script docs, "Other
+// data and timeframes" / "Repainting"): offset the expression by [1] and pair
+// it with barmerge.lookahead_on so every bar only ever sees the last FULLY
+// CLOSED higher-timeframe value, both in history and in real time.
+htfSecurity(tf, expr) =>
+    request.security(syminfo.tickerid, tf, expr[1], lookahead = barmerge.lookahead_on)
+
+// Pure computation, no side effects - safe to call from inside conditionals.
+// Bullish setup: swept below Reference Low, closed back above it. Entry proxy
+// is the Middle Candle's high; target is the Reference Candle's high.
+f_computeBullSetup(refHigh, refLow, midHigh, atrVal) =>
+    reward   = refHigh - midHigh
+    valid    = reward > syminfo.mintick * 2
+    crtRange = refHigh - refLow
+    rr       = i_useManualRR ? i_manualRR : (na(atrVal) ? i_rrWide : (crtRange <= atrVal * i_atrThresholdMult ? i_rrTight : i_rrWide))
+    riskPx   = valid ? reward / rr : na
+    target   = valid ? refHigh : na
+    stopPx   = valid ? midHigh - riskPx : na
+    [valid, target, stopPx, riskPx]
+
+// Bearish setup: swept above Reference High, closed back below it. Entry proxy
+// is the Middle Candle's low; target is the Reference Candle's low.
+f_computeBearSetup(refHigh, refLow, midLow, atrVal) =>
+    reward   = midLow - refLow
+    valid    = reward > syminfo.mintick * 2
+    crtRange = refHigh - refLow
+    rr       = i_useManualRR ? i_manualRR : (na(atrVal) ? i_rrWide : (crtRange <= atrVal * i_atrThresholdMult ? i_rrTight : i_rrWide))
+    riskPx   = valid ? reward / rr : na
+    target   = valid ? refLow : na
+    stopPx   = valid ? midLow + riskPx : na
+    [valid, target, stopPx, riskPx]
+
+// =============================================================================
+// SESSION DETECTION (evaluated on the chart's own/native timeframe)
+// =============================================================================
+sessionActiveNY = not na(time(timeframe.period, i_nySession, i_nyTz))
+sessionActiveAL = not na(time(timeframe.period, i_alSession, i_alTz))
+
+// =============================================================================
+// SESSION HIGH/LOW RANGE (a box per session that builds live and freezes at
+// session end - separate from the CRT reference/middle candle boxes below)
+// =============================================================================
+nySessionJustStarted = sessionActiveNY and not sessionActiveNY[1]
+alSessionJustStarted = sessionActiveAL and not sessionActiveAL[1]
+
+var float nySessionHigh = na
+var float nySessionLow  = na
+var box   nySessionBox  = na
+var float alSessionHigh = na
+var float alSessionLow  = na
+var box   alSessionBox  = na
+
+if nySessionJustStarted
+    nySessionHigh := high
+    nySessionLow  := low
+    if not na(nySessionBox)
+        box.delete(nySessionBox)
+        nySessionBox := na
+    if i_showSessionRange
+        nySessionBox := box.new(left = bar_index, top = high, right = bar_index, bottom = low, border_color = color.new(color.blue, 0), border_width = 2, bgcolor = color.new(color.blue, 82), extend = extend.none, text = "NY", text_size = size.small, text_color = color.new(color.blue, 0), text_valign = text.align_top)
+else if sessionActiveNY
+    nySessionHigh := math.max(nySessionHigh, high)
+    nySessionLow  := math.min(nySessionLow, low)
+    if i_showSessionRange and not na(nySessionBox)
+        box.set_top(nySessionBox, nySessionHigh)
+        box.set_bottom(nySessionBox, nySessionLow)
+        box.set_right(nySessionBox, bar_index)
+
+if alSessionJustStarted
+    alSessionHigh := high
+    alSessionLow  := low
+    if not na(alSessionBox)
+        box.delete(alSessionBox)
+        alSessionBox := na
+    if i_showSessionRange
+        alSessionBox := box.new(left = bar_index, top = high, right = bar_index, bottom = low, border_color = color.new(color.purple, 0), border_width = 2, bgcolor = color.new(color.purple, 82), extend = extend.none, text = "AL", text_size = size.small, text_color = color.new(color.purple, 0), text_valign = text.align_top)
+else if sessionActiveAL
+    alSessionHigh := math.max(alSessionHigh, high)
+    alSessionLow  := math.min(alSessionLow, low)
+    if i_showSessionRange and not na(alSessionBox)
+        box.set_top(alSessionBox, alSessionHigh)
+        box.set_bottom(alSessionBox, alSessionLow)
+        box.set_right(alSessionBox, bar_index)
+
+// =============================================================================
+// MULTI-TIMEFRAME DATA - NY (1H) ANCHOR
+// =============================================================================
+nyHigh1  = htfSecurity(i_anchorNY, high)
+nyLow1   = htfSecurity(i_anchorNY, low)
+nyClose1 = htfSecurity(i_anchorNY, close)
+nyTime1  = htfSecurity(i_anchorNY, time)
+nyATR1   = htfSecurity(i_anchorNY, ta.atr(i_atrLen))
+
+// A fresh anchor bar just became visible: guard every na() check as a ternary
+// condition rather than an and/or operand (Pine v5's and/or do not
+// short-circuit, and a comparison against na is itself na - chaining that into
+// an and/or can silently produce na instead of the intended true/false).
+nyNewBar = na(nyTime1) ? false : (na(nyTime1[1]) ? true : nyTime1 != nyTime1[1])
+
+var float nyRefHigh  = na
+var float nyRefLow   = na
+var float nyMidHigh  = na
+var float nyMidLow   = na
+var float nyMidClose = na
+
+if nyNewBar
+    nyRefHigh  := nyMidHigh
+    nyRefLow   := nyMidLow
+    nyMidHigh  := nyHigh1
+    nyMidLow   := nyLow1
+    nyMidClose := nyClose1
+
+// =============================================================================
+// MULTI-TIMEFRAME DATA - ASIAN/LONDON (15m) ANCHOR
+// =============================================================================
+alHigh1  = htfSecurity(i_anchorAL, high)
+alLow1   = htfSecurity(i_anchorAL, low)
+alClose1 = htfSecurity(i_anchorAL, close)
+alTime1  = htfSecurity(i_anchorAL, time)
+alATR1   = htfSecurity(i_anchorAL, ta.atr(i_atrLen))
+
+alNewBar = na(alTime1) ? false : (na(alTime1[1]) ? true : alTime1 != alTime1[1])
+
+var float alRefHigh  = na
+var float alRefLow   = na
+var float alMidHigh  = na
+var float alMidLow   = na
+var float alMidClose = na
+
+if alNewBar
+    alRefHigh  := alMidHigh
+    alRefLow   := alMidLow
+    alMidHigh  := alHigh1
+    alMidLow   := alLow1
+    alMidClose := alClose1
+
+// =============================================================================
+// 30m CONFLUENCE DATA
+// =============================================================================
+c30High = htfSecurity(i_confluenceTF, high)
+c30Low  = htfSecurity(i_confluenceTF, low)
+
+// =============================================================================
+// DAILY BIAS ENGINE - market structure = sequence of confirmed swing pivots
+// =============================================================================
+dPH = htfSecurity("D", ta.pivothigh(high, i_dailySwingLB, i_dailySwingLB))
+dPL = htfSecurity("D", ta.pivotlow(low, i_dailySwingLB, i_dailySwingLB))
+
+freshPH = na(dPH) ? false : (na(dPH[1]) ? true : dPH != dPH[1])
+freshPL = na(dPL) ? false : (na(dPL[1]) ? true : dPL != dPL[1])
+
+var float swH1 = na
+var float swH2 = na
+var float swL1 = na
+var float swL2 = na
+
+if freshPH
+    swH2 := swH1
+    swH1 := dPH
+if freshPL
+    swL2 := swL1
+    swL1 := dPL
+
+haveTwoSwings = not na(swH1) and not na(swH2) and not na(swL1) and not na(swL2)
+biasBullish = haveTwoSwings ? (swH1 > swH2 and swL1 > swL2) : false
+biasBearish = haveTwoSwings ? (swH1 < swH2 and swL1 < swL2) : false
+
+// =============================================================================
+// PENDING SETUP + ACTIVE TRADE + DIAGNOSTIC STATE
+// =============================================================================
+var int   pendDir     = 0     // 0 none, 1 bullish pending, -1 bearish pending
+var float pendRefHigh = na
+var float pendRefLow  = na
+var float pendMidHigh = na
+var float pendMidLow  = na
+var float pendTarget  = na
+var float pendStop    = na
+var float pendRisk    = na
+var bool  pendAPlus   = false
+var bool  pendFromNY  = true
+
+var float activeTarget  = na
+var float activeStop    = na
+var float activeEntryPx = na
+var int   activeDir     = 0
+
+var box activeStopBox   = na
+var box activeTargetBox = na
+
+var int cntSweepValid        = 0
+var int cntInvalidated       = 0
+var int cntExpired           = 0
+var int cntSkippedSize       = 0
+var int cntSkippedConfluence = 0
+var int cntEntries           = 0
+
+var box  pendRefBox      = na
+var box  pendMidBox      = na
+var line pendTriggerLine = na
+
+boxHalfWidth = 3
+
+// =============================================================================
+// NY (1H) SWEEP DETECTION -> SETUP FORMATION
+// =============================================================================
+if nyNewBar and sessionActiveNY and not na(nyRefHigh) and not na(nyRefLow) and not na(nyMidHigh) and not na(nyMidLow) and not na(nyMidClose)
+    ny_sweptHigh = nyMidHigh > nyRefHigh
+    ny_sweptLow  = nyMidLow < nyRefLow
+    ny_bothSwept = ny_sweptHigh and ny_sweptLow
+    ny_bearOK    = ny_sweptHigh and not ny_bothSwept and nyMidClose < nyRefHigh
+    ny_bullOK    = ny_sweptLow and not ny_bothSwept and nyMidClose > nyRefLow
+
+    if ny_bothSwept
+        cntInvalidated := cntInvalidated + 1
+        if i_showInvalidated
+            label.new(bar_index, nyMidHigh, "", style = label.style_xcross, size = size.tiny, color = color.new(color.gray, 40))
+
+    // Sweep marker sits at the exact wick tip that pierced the level, for every
+    // valid sweep regardless of bias - full color when it becomes a tradeable
+    // setup, muted gray when it's a genuine sweep but skipped as counter-trend.
+    if i_showSweepMarkers and ny_bearOK
+        label.new(bar_index, nyMidHigh, "", style = label.style_diamond, size = size.tiny, color = biasBearish ? color.new(color.red, 0) : color.new(color.gray, 55))
+    if i_showSweepMarkers and ny_bullOK
+        label.new(bar_index, nyMidLow, "", style = label.style_diamond, size = size.tiny, color = biasBullish ? color.new(color.green, 0) : color.new(color.gray, 55))
+
+    if ny_bearOK and biasBearish
+        [nyBearValid, nyBearTarget, nyBearStop, nyBearRisk] = f_computeBearSetup(nyRefHigh, nyRefLow, nyMidLow, nyATR1)
+        if nyBearValid
+            if not na(pendRefBox)
+                box.delete(pendRefBox)
+            if not na(pendMidBox)
+                box.delete(pendMidBox)
+            if not na(pendTriggerLine)
+                line.delete(pendTriggerLine)
+            pendDir     := -1
+            pendRefHigh := nyRefHigh
+            pendRefLow  := nyRefLow
+            pendMidHigh := nyMidHigh
+            pendMidLow  := nyMidLow
+            pendTarget  := nyBearTarget
+            pendStop    := nyBearStop
+            pendRisk    := nyBearRisk
+            pendFromNY  := true
+            pendAPlus   := na(c30High) ? false : c30High >= nyRefHigh
+            cntSweepValid := cntSweepValid + 1
+            if i_showBoxes
+                pendRefBox := box.new(left = bar_index - boxHalfWidth * 2, top = nyRefHigh, right = bar_index - boxHalfWidth, bottom = nyRefLow, border_color = color.new(color.gray, 30), bgcolor = color.new(color.gray, 85), extend = extend.none)
+                pendMidBox := box.new(left = bar_index - boxHalfWidth, top = nyMidHigh, right = bar_index, bottom = nyMidLow, border_color = color.new(color.red, 20), bgcolor = color.new(color.red, 80), extend = extend.none)
+                pendTriggerLine := line.new(x1 = bar_index, y1 = nyMidLow, x2 = bar_index + 1, y2 = nyMidLow, extend = extend.right, color = color.red, style = line.style_dashed)
+
+    if ny_bullOK and biasBullish
+        [nyBullValid, nyBullTarget, nyBullStop, nyBullRisk] = f_computeBullSetup(nyRefHigh, nyRefLow, nyMidHigh, nyATR1)
+        if nyBullValid
+            if not na(pendRefBox)
+                box.delete(pendRefBox)
+            if not na(pendMidBox)
+                box.delete(pendMidBox)
+            if not na(pendTriggerLine)
+                line.delete(pendTriggerLine)
+            pendDir     := 1
+            pendRefHigh := nyRefHigh
+            pendRefLow  := nyRefLow
+            pendMidHigh := nyMidHigh
+            pendMidLow  := nyMidLow
+            pendTarget  := nyBullTarget
+            pendStop    := nyBullStop
+            pendRisk    := nyBullRisk
+            pendFromNY  := true
+            pendAPlus   := na(c30Low) ? false : c30Low <= nyRefLow
+            cntSweepValid := cntSweepValid + 1
+            if i_showBoxes
+                pendRefBox := box.new(left = bar_index - boxHalfWidth * 2, top = nyRefHigh, right = bar_index - boxHalfWidth, bottom = nyRefLow, border_color = color.new(color.gray, 30), bgcolor = color.new(color.gray, 85), extend = extend.none)
+                pendMidBox := box.new(left = bar_index - boxHalfWidth, top = nyMidHigh, right = bar_index, bottom = nyMidLow, border_color = color.new(color.green, 20), bgcolor = color.new(color.green, 80), extend = extend.none)
+                pendTriggerLine := line.new(x1 = bar_index, y1 = nyMidHigh, x2 = bar_index + 1, y2 = nyMidHigh, extend = extend.right, color = color.green, style = line.style_dashed)
+
+// =============================================================================
+// ASIAN/LONDON (15m) SWEEP DETECTION -> SETUP FORMATION
+// =============================================================================
+if alNewBar and sessionActiveAL and not na(alRefHigh) and not na(alRefLow) and not na(alMidHigh) and not na(alMidLow) and not na(alMidClose)
+    al_sweptHigh = alMidHigh > alRefHigh
+    al_sweptLow  = alMidLow < alRefLow
+    al_bothSwept = al_sweptHigh and al_sweptLow
+    al_bearOK    = al_sweptHigh and not al_bothSwept and alMidClose < alRefHigh
+    al_bullOK    = al_sweptLow and not al_bothSwept and alMidClose > alRefLow
+
+    if al_bothSwept
+        cntInvalidated := cntInvalidated + 1
+        if i_showInvalidated
+            label.new(bar_index, alMidHigh, "", style = label.style_xcross, size = size.tiny, color = color.new(color.gray, 40))
+
+    if i_showSweepMarkers and al_bearOK
+        label.new(bar_index, alMidHigh, "", style = label.style_diamond, size = size.tiny, color = biasBearish ? color.new(color.red, 0) : color.new(color.gray, 55))
+    if i_showSweepMarkers and al_bullOK
+        label.new(bar_index, alMidLow, "", style = label.style_diamond, size = size.tiny, color = biasBullish ? color.new(color.green, 0) : color.new(color.gray, 55))
+
+    if al_bearOK and biasBearish
+        [alBearValid, alBearTarget, alBearStop, alBearRisk] = f_computeBearSetup(alRefHigh, alRefLow, alMidLow, alATR1)
+        if alBearValid
+            if not na(pendRefBox)
+                box.delete(pendRefBox)
+            if not na(pendMidBox)
+                box.delete(pendMidBox)
+            if not na(pendTriggerLine)
+                line.delete(pendTriggerLine)
+            pendDir     := -1
+            pendRefHigh := alRefHigh
+            pendRefLow  := alRefLow
+            pendMidHigh := alMidHigh
+            pendMidLow  := alMidLow
+            pendTarget  := alBearTarget
+            pendStop    := alBearStop
+            pendRisk    := alBearRisk
+            pendFromNY  := false
+            pendAPlus   := na(c30High) ? false : c30High >= alRefHigh
+            cntSweepValid := cntSweepValid + 1
+            if i_showBoxes
+                pendRefBox := box.new(left = bar_index - boxHalfWidth * 2, top = alRefHigh, right = bar_index - boxHalfWidth, bottom = alRefLow, border_color = color.new(color.gray, 30), bgcolor = color.new(color.gray, 85), extend = extend.none)
+                pendMidBox := box.new(left = bar_index - boxHalfWidth, top = alMidHigh, right = bar_index, bottom = alMidLow, border_color = color.new(color.red, 20), bgcolor = color.new(color.red, 80), extend = extend.none)
+                pendTriggerLine := line.new(x1 = bar_index, y1 = alMidLow, x2 = bar_index + 1, y2 = alMidLow, extend = extend.right, color = color.red, style = line.style_dashed)
+
+    if al_bullOK and biasBullish
+        [alBullValid, alBullTarget, alBullStop, alBullRisk] = f_computeBullSetup(alRefHigh, alRefLow, alMidHigh, alATR1)
+        if alBullValid
+            if not na(pendRefBox)
+                box.delete(pendRefBox)
+            if not na(pendMidBox)
+                box.delete(pendMidBox)
+            if not na(pendTriggerLine)
+                line.delete(pendTriggerLine)
+            pendDir     := 1
+            pendRefHigh := alRefHigh
+            pendRefLow  := alRefLow
+            pendMidHigh := alMidHigh
+            pendMidLow  := alMidLow
+            pendTarget  := alBullTarget
+            pendStop    := alBullStop
+            pendRisk    := alBullRisk
+            pendFromNY  := false
+            pendAPlus   := na(c30Low) ? false : c30Low <= alRefLow
+            cntSweepValid := cntSweepValid + 1
+            if i_showBoxes
+                pendRefBox := box.new(left = bar_index - boxHalfWidth * 2, top = alRefHigh, right = bar_index - boxHalfWidth, bottom = alRefLow, border_color = color.new(color.gray, 30), bgcolor = color.new(color.gray, 85), extend = extend.none)
+                pendMidBox := box.new(left = bar_index - boxHalfWidth, top = alMidHigh, right = bar_index, bottom = alMidLow, border_color = color.new(color.green, 20), bgcolor = color.new(color.green, 80), extend = extend.none)
+                pendTriggerLine := line.new(x1 = bar_index, y1 = alMidHigh, x2 = bar_index + 1, y2 = alMidHigh, extend = extend.right, color = color.green, style = line.style_dashed)
+
+// =============================================================================
+// ENTRY TRIGGER (runs every bar, on the chart's own/native timeframe)
+// =============================================================================
+bool enteredLongThisBar  = false
+bool enteredShortThisBar = false
+
+if pendDir == -1 and strategy.position_size == 0
+    triggerShort = i_requireCloseConfirm ? (close < pendMidLow) : (low < pendMidLow)
+    if triggerShort
+        riskCapital  = strategy.equity * (i_riskPercent / 100.0)
+        pointVal     = syminfo.pointvalue > 0 ? syminfo.pointvalue : 1.0
+        riskBasedQty = pendRisk > 0 ? riskCapital / (pendRisk * pointVal) : 0.0
+        qtyFinal     = math.floor(math.min(riskBasedQty, i_maxContracts))
+        allowTrade   = not i_requireConfluence or pendAPlus
+        if qtyFinal >= 1 and allowTrade
+            strategy.entry("Short", strategy.short, qty = qtyFinal)
+            activeTarget  := pendTarget
+            activeStop    := pendStop
+            activeEntryPx := pendMidLow
+            activeDir     := -1
+            cntEntries    := cntEntries + 1
+            enteredShortThisBar := true
+            if i_showLabels
+                label.new(bar_index, high, "", style = label.style_triangledown, size = size.small, color = color.new(color.red, 0))
+            if not na(activeStopBox)
+                box.delete(activeStopBox)
+            if not na(activeTargetBox)
+                box.delete(activeTargetBox)
+            // Short: stop sits above entry (darker band), target sits below entry (lighter band)
+            activeStopBox   := box.new(left = bar_index, top = activeStop, right = bar_index, bottom = activeEntryPx, border_color = color.new(#4D4D4D, 20), bgcolor = color.new(#4D4D4D, 15), extend = extend.none)
+            activeTargetBox := box.new(left = bar_index, top = activeEntryPx, right = bar_index, bottom = activeTarget, border_color = color.new(#B0B7C3, 30), bgcolor = color.new(#B0B7C3, 45), extend = extend.none)
+        else if qtyFinal < 1
+            cntSkippedSize := cntSkippedSize + 1
+        else if not allowTrade
+            cntSkippedConfluence := cntSkippedConfluence + 1
+        pendDir := 0
+        if not na(pendRefBox)
+            box.delete(pendRefBox)
+            pendRefBox := na
+        if not na(pendMidBox)
+            box.delete(pendMidBox)
+            pendMidBox := na
+        if not na(pendTriggerLine)
+            line.delete(pendTriggerLine)
+            pendTriggerLine := na
+
+if pendDir == 1 and strategy.position_size == 0
+    triggerLong = i_requireCloseConfirm ? (close > pendMidHigh) : (high > pendMidHigh)
+    if triggerLong
+        riskCapital  = strategy.equity * (i_riskPercent / 100.0)
+        pointVal     = syminfo.pointvalue > 0 ? syminfo.pointvalue : 1.0
+        riskBasedQty = pendRisk > 0 ? riskCapital / (pendRisk * pointVal) : 0.0
+        qtyFinal     = math.floor(math.min(riskBasedQty, i_maxContracts))
+        allowTrade   = not i_requireConfluence or pendAPlus
+        if qtyFinal >= 1 and allowTrade
+            strategy.entry("Long", strategy.long, qty = qtyFinal)
+            activeTarget  := pendTarget
+            activeStop    := pendStop
+            activeEntryPx := pendMidHigh
+            activeDir     := 1
+            cntEntries    := cntEntries + 1
+            enteredLongThisBar := true
+            if i_showLabels
+                label.new(bar_index, low, "", style = label.style_triangleup, size = size.small, color = color.new(color.green, 0))
+            if not na(activeStopBox)
+                box.delete(activeStopBox)
+            if not na(activeTargetBox)
+                box.delete(activeTargetBox)
+            // Long: stop sits below entry (darker band), target sits above entry (lighter band)
+            activeStopBox   := box.new(left = bar_index, top = activeEntryPx, right = bar_index, bottom = activeStop, border_color = color.new(#4D4D4D, 20), bgcolor = color.new(#4D4D4D, 15), extend = extend.none)
+            activeTargetBox := box.new(left = bar_index, top = activeTarget, right = bar_index, bottom = activeEntryPx, border_color = color.new(#B0B7C3, 30), bgcolor = color.new(#B0B7C3, 45), extend = extend.none)
+        else if qtyFinal < 1
+            cntSkippedSize := cntSkippedSize + 1
+        else if not allowTrade
+            cntSkippedConfluence := cntSkippedConfluence + 1
+        pendDir := 0
+        if not na(pendRefBox)
+            box.delete(pendRefBox)
+            pendRefBox := na
+        if not na(pendMidBox)
+            box.delete(pendMidBox)
+            pendMidBox := na
+        if not na(pendTriggerLine)
+            line.delete(pendTriggerLine)
+            pendTriggerLine := na
+
+// =============================================================================
+// PENDING SETUP EXPIRY (at the corresponding session's end)
+// =============================================================================
+if pendDir != 0
+    expireNow = (pendFromNY and not sessionActiveNY) or ((not pendFromNY) and not sessionActiveAL)
+    if expireNow
+        cntExpired := cntExpired + 1
+        pendDir := 0
+        if not na(pendRefBox)
+            box.delete(pendRefBox)
+            pendRefBox := na
+        if not na(pendMidBox)
+            box.delete(pendMidBox)
+            pendMidBox := na
+        if not na(pendTriggerLine)
+            line.delete(pendTriggerLine)
+            pendTriggerLine := na
+
+// =============================================================================
+// TRADE MANAGEMENT (runs while a position is open)
+// =============================================================================
+aggPivotLow  = ta.pivotlow(low, i_aggressiveLB, i_aggressiveLB)
+aggPivotHigh = ta.pivothigh(high, i_aggressiveLB, i_aggressiveLB)
+
+if strategy.position_size > 0
+    if i_trailMode == "Conservative (Breakeven at 50%)"
+        if not na(strategy.position_avg_price) and not na(activeTarget) and not na(activeStop)
+            halfway = strategy.position_avg_price + 0.5 * (activeTarget - strategy.position_avg_price)
+            if high >= halfway and activeStop < strategy.position_avg_price
+                activeStop := strategy.position_avg_price
+    else
+        if not na(aggPivotLow) and not na(activeStop) and aggPivotLow > activeStop
+            activeStop := aggPivotLow
+    strategy.exit("Long Exit", from_entry = "Long", stop = activeStop, limit = activeTarget,
+         comment_loss = "SL", comment_profit = "TP",
+         alert_loss = "CRT Long stopped out", alert_profit = "CRT Long target hit")
+    if not na(activeStopBox)
+        box.set_bottom(activeStopBox, activeStop)
+        box.set_right(activeStopBox, bar_index)
+    if not na(activeTargetBox)
+        box.set_right(activeTargetBox, bar_index)
+
+if strategy.position_size < 0
+    if i_trailMode == "Conservative (Breakeven at 50%)"
+        if not na(strategy.position_avg_price) and not na(activeTarget) and not na(activeStop)
+            halfway = strategy.position_avg_price - 0.5 * (strategy.position_avg_price - activeTarget)
+            if low <= halfway and activeStop > strategy.position_avg_price
+                activeStop := strategy.position_avg_price
+    else
+        if not na(aggPivotHigh) and not na(activeStop) and aggPivotHigh < activeStop
+            activeStop := aggPivotHigh
+    strategy.exit("Short Exit", from_entry = "Short", stop = activeStop, limit = activeTarget,
+         comment_loss = "SL", comment_profit = "TP",
+         alert_loss = "CRT Short stopped out", alert_profit = "CRT Short target hit")
+    if not na(activeStopBox)
+        box.set_top(activeStopBox, activeStop)
+        box.set_right(activeStopBox, bar_index)
+    if not na(activeTargetBox)
+        box.set_right(activeTargetBox, bar_index)
+
+if strategy.position_size == 0
+    activeDir := 0
+
+// =============================================================================
+// CHART TIMEFRAME WARNING
+// =============================================================================
+if barstate.islast and timeframe.in_seconds() > 180
+    label.new(bar_index, high, "CRT strategy expects a 1-2 minute chart for entry precision (current: " + timeframe.period + ")", style = label.style_label_down, color = color.new(color.orange, 20), textcolor = color.white, size = size.small)
+
+// =============================================================================
+// INFO / DIAGNOSTICS TABLE
+// =============================================================================
+if i_showTable and barstate.islast
+    var table infoTable = table.new(position.top_right, 2, 14, bgcolor = color.new(color.black, 70), border_color = color.gray, border_width = 1)
+    sessionLabel = sessionActiveNY ? "New York (1H anchor)" : sessionActiveAL ? "Asian/London (15m anchor)" : "Outside Sessions"
+    biasLabel = biasBullish ? "Bullish (HH/HL)" : biasBearish ? "Bearish (LH/LL)" : "Mixed / No Trade"
+    pendingLabel = pendDir == 1 ? "Bullish @ " + str.tostring(pendMidHigh, format.mintick) : pendDir == -1 ? "Bearish @ " + str.tostring(pendMidLow, format.mintick) : "None"
+    confluenceLabel = pendDir != 0 ? (pendAPlus ? "Yes" : "No") : "—"
+    winRatePct = strategy.closedtrades > 0 ? (float(strategy.wintrades) / strategy.closedtrades) * 100 : na
+
+    table.cell(infoTable, 0, 0, "Session", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, sessionLabel, text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 1, "Daily Bias", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, biasLabel, text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 2, "Pending Setup", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 2, pendingLabel, text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 3, "30m Confluence (A+)", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 3, confluenceLabel, text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 4, "— Diagnostics —", text_color = color.gray, text_halign = text.align_left)
+    table.cell(infoTable, 1, 4, "", text_color = color.gray, text_halign = text.align_right)
+    table.cell(infoTable, 0, 5, "Valid Sweeps Formed", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 5, str.tostring(cntSweepValid), text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 6, "Invalidated (Both Sides)", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 6, str.tostring(cntInvalidated), text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 7, "Expired Unfilled", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 7, str.tostring(cntExpired), text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 8, "Skipped (Size Too Small)", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 8, str.tostring(cntSkippedSize), text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 9, "Skipped (No Confluence)", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 9, str.tostring(cntSkippedConfluence), text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 10, "Entries Triggered", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 10, str.tostring(cntEntries), text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 11, "Closed Trades", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 11, str.tostring(strategy.closedtrades), text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 12, "Win Rate", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 12, na(winRatePct) ? "—" : str.tostring(winRatePct, "#.#") + "%", text_color = color.yellow, text_halign = text.align_right)
+    table.cell(infoTable, 0, 13, "Net Profit", text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 13, str.tostring(strategy.netprofit, format.mintick), text_color = color.yellow, text_halign = text.align_right)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(enteredLongThisBar, title = "CRT Long Entry", message = "CRT MTF: Long entry triggered on {{ticker}} at {{close}}")
+alertcondition(enteredShortThisBar, title = "CRT Short Entry", message = "CRT MTF: Short entry triggered on {{ticker}} at {{close}}")
